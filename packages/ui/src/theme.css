@@ -1,0 +1,47 @@
+/*
+ * Brand tokens. Each --color-* becomes Tailwind utilities automatically
+ * (--color-primary → bg-primary, text-primary, border-primary, ...).
+ * Import after `@import "tailwindcss";` in each app's globals.css.
+ */
+@theme {
+  /* Main buttons, headers. White text on it: 9.5:1 */
+  --color-primary: #204289;
+  --color-primary-foreground: #ffffff;
+  /* Secondary buttons. White text: 8.1:1 */
+  --color-secondary: #394e85;
+  --color-secondary-foreground: #ffffff;
+  /* Fills and icons only: as text on white it is 3.0:1 (fails WCAG AA). */
+  --color-accent: #00a89d;
+  /* Text on accent fills (5.8:1). White on accent fails. */
+  --color-accent-foreground: #0b1b33;
+  /* Accent-coloured text and links (5.2:1). */
+  --color-accent-strong: #007a72;
+
+  --color-background: #f7f7f7;
+  --color-surface: #ffffff;
+  --color-foreground: #0b1b33;
+  /* Secondary text (5.6:1). */
+  --color-muted: #5b6475;
+  --color-border: #d9dde5;
+
+  --color-success: #15803d;
+  --color-success-soft: #dcfce7;
+  --color-warning: #b45309;
+  --color-warning-soft: #fef3c7;
+  --color-danger: #b91c1c;
+  --color-danger-soft: #fee2e2;
+  --color-info: #1d4ed8;
+  --color-info-soft: #dbeafe;
+}
+
+@layer base {
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+  }
+}

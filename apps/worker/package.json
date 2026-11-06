@@ -1,0 +1,36 @@
+{
+  "name": "worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "test:int": "vitest run --config vitest.int.config.ts",
+    "build": "node build.mjs",
+    "start": "node dist/index.mjs",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@gym/eslint-config": "workspace:*",
+    "@gym/testing": "workspace:*",
+    "@gym/typescript-config": "workspace:*",
+    "@types/node": "26.4.1",
+    "esbuild": "^0.28.2",
+    "eslint": "10.9.1",
+    "tsx": "^4",
+    "typescript": "7.0.2",
+    "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "@gym/auth": "workspace:*",
+    "@gym/core": "workspace:*",
+    "@gym/db": "workspace:*",
+    "@gym/env": "workspace:*",
+    "@gym/integrations": "workspace:*",
+    "bullmq": "^6.5.3",
+    "dotenv": "^18.0.9",
+    "ioredis": "5.11.1"
+  }
+}

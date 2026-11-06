@@ -1,0 +1,89 @@
+{
+  "$schema": "https://turborepo.dev/schema.json",
+  "ui": "tui",
+  "globalDependencies": [".env"],
+  "globalEnv": [
+    "NODE_ENV",
+    "LOG_LEVEL",
+    "APP_URL",
+    "ADMIN_URL",
+    "MIGRATION_DATABASE_URL",
+    "DATABASE_URL",
+    "PLATFORM_DATABASE_URL",
+    "REDIS_URL",
+    "WORKER_HEALTH_PORT",
+    "S3_ENDPOINT",
+    "S3_REGION",
+    "S3_BUCKET",
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+    "S3_FORCE_PATH_STYLE",
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "EMAIL_FROM",
+    "BUILD_STANDALONE",
+    "CI",
+    "APP_NAME",
+    "AUTH_SECRET",
+    "ADMIN_AUTH_SECRET",
+    "DATA_ENCRYPTION_KEY",
+    "DATA_ENCRYPTION_KEY_PREVIOUS",
+    "PLATFORM_INTERNAL_SECRET",
+    "META_APP_ID",
+    "META_APP_SECRET",
+    "META_WEBHOOK_VERIFY_TOKEN",
+    "META_EMBEDDED_SIGNUP_CONFIG_ID",
+    "WHATSAPP_FAKE_ENABLED",
+    "PAYMENTS_FAKE_ENABLED",
+    "GOOGLE_CLIENT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "EMAIL_PROVIDER",
+    "SES_REGION",
+    "SEED_ADMIN_EMAIL",
+    "SEED_ADMIN_PASSWORD",
+    "SEED_ADMIN_NAME",
+    "SEED_DEMO_PASSWORD",
+    "UI_SHOWCASE"
+  ],
+  "globalPassThroughEnv": [
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "MAILPIT_URL",
+    "TESTCONTAINERS",
+    "DOCKER_HOST",
+    "TESTCONTAINERS_RYUK_DISABLED",
+    "E2E_BASE_URL",
+    "E2E_ADMIN_URL"
+  ],
+  "tasks": {
+    "db:generate": {
+      "cache": false
+    },
+    "build": {
+      "dependsOn": ["^build", "^db:generate", "db:generate"],
+      "inputs": ["$TURBO_DEFAULT$", ".env*"],
+      "outputs": [".next/**", "!.next/cache/**", "!.next/dev/**", "dist/**"]
+    },
+    "lint": {
+      "dependsOn": ["^lint", "^db:generate", "db:generate"]
+    },
+    "check-types": {
+      "dependsOn": ["^check-types", "^db:generate", "db:generate"]
+    },
+    "test": {
+      "dependsOn": ["^db:generate", "db:generate"]
+    },
+    "test:int": {
+      "dependsOn": ["^db:generate", "db:generate"],
+      "cache": false
+    },
+    "test:e2e": {
+      "dependsOn": ["build"],
+      "cache": false
+    },
+    "dev": {
+      "dependsOn": ["^db:generate", "db:generate"],
+      "cache": false,
+      "persistent": true
+    }
+  }
+}

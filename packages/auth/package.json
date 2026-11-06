@@ -1,0 +1,45 @@
+{
+  "name": "@gym/auth",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./permissions": "./src/permissions.ts",
+    "./tenant": "./src/tenant/index.ts",
+    "./platform": "./src/platform/index.ts",
+    "./otp": "./src/otp.ts",
+    "./rate-limit": "./src/rate-limit.ts",
+    "./context": "./src/context.ts"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "test": "vitest run",
+    "test:int": "vitest run --config vitest.int.config.ts",
+    "seed:demo": "tsx scripts/seed-demo.ts",
+    "create-admin": "tsx scripts/create-platform-admin.ts",
+    "docs:permissions": "tsx scripts/generate-permissions-doc.ts",
+    "metrics:rebuild": "tsx scripts/rebuild-metrics.ts"
+  },
+  "dependencies": {
+    "@gym/core": "workspace:*",
+    "@gym/db": "workspace:*",
+    "@gym/integrations": "workspace:*",
+    "better-auth": "1.7.14",
+    "ioredis": "5.11.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@gym/eslint-config": "workspace:*",
+    "@gym/testing": "workspace:*",
+    "@gym/typescript-config": "workspace:*",
+    "@types/node": "26.4.1",
+    "@types/pg": "^8.23.1",
+    "dotenv": "^18.0.9",
+    "eslint": "10.9.1",
+    "pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

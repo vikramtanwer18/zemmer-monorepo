@@ -1,0 +1,4972 @@
+// Platform tables live in schema "platform", tenant (gym) tables in schema "app".
+// Every tenant-owned table in "app" gets a row-level security policy (see migrations) and an entry
+// in src/tenant-models.ts. test/registry.test.ts fails if either is missing.
+//
+// Auth tables follow Better Auth's field names (see packages/auth). The two realms use separate
+// tables: PlatformUser/PlatformSession/... (schema platform) and User/Session/... (schema app).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  schemas  = ["platform", "app"]
+}
+
+/// Placeholder from M0; kept so the first migration stays valid.
+model HealthCheck {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("health_check")
+  @@schema("platform")
+}
+
+// ===================================================================================
+// Platform realm: operator accounts (apps/admin)
+// ===================================================================================
+
+enum PlatformRole {
+  SUPER_ADMIN
+  SUPPORT
+
+  @@schema("platform")
+}
+
+enum PlatformUserStatus {
+  ACTIVE
+  DISABLED
+
+  @@schema("platform")
+}
+
+model PlatformUser {
+  id            String             @id @default(uuid()) @db.Uuid
+  name          String
+  email         String             @unique
+  emailVerified Boolean            @default(false) @map("email_verified")
+  image         String?
+  role          PlatformRole       @default(SUPPORT)
+  status        PlatformUserStatus @default(ACTIVE)
+  createdAt     DateTime           @default(now()) @map("created_at")
+  updatedAt     DateTime           @updatedAt @map("updated_at")
+
+  sessions        PlatformSession[]
+  accounts        PlatformAccount[]
+  auditLogs       PlatformAuditLog[]
+  supportSessions SupportSession[]
+
+  @@map("platform_user")
+  @@schema("platform")
+}
+
+model PlatformSession {
+  id            String    @id @default(uuid()) @db.Uuid
+  token         String    @unique
+  userId        String    @map("user_id") @db.Uuid
+  expiresAt     DateTime  @map("expires_at")
+  ipAddress     String?   @map("ip_address")
+  userAgent     String?   @map("user_agent")
+  /// Set when the email OTP second factor passes. Mandatory for every platform user.
+  mfaVerifiedAt DateTime? @map("mfa_verified_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  user          PlatformUser           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  otpChallenges PlatformOtpChallenge[]
+
+  @@index([userId])
+  @@map("platform_session")
+  @@schema("platform")
+}
+
+model PlatformAccount {
+  id                    String    @id @default(uuid()) @db.Uuid
+  accountId             String    @map("account_id")
+  providerId            String    @map("provider_id")
+  userId                String    @map("user_id") @db.Uuid
+  accessToken           String?   @map("access_token")
+  refreshToken          String?   @map("refresh_token")
+  idToken               String?   @map("id_token")
+  accessTokenExpiresAt  DateTime? @map("access_token_expires_at")
+  refreshTokenExpiresAt DateTime? @map("refresh_token_expires_at")
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  user PlatformUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("platform_account")
+  @@schema("platform")
+}
+
+model PlatformVerification {
+  id         String   @id @default(uuid()) @db.Uuid
+  identifier String
+  value      String
+  expiresAt  DateTime @map("expires_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@index([identifier])
+  @@map("platform_verification")
+  @@schema("platform")
+}
+
+model PlatformOtpChallenge {
+  id         String    @id @default(uuid()) @db.Uuid
+  sessionId  String    @map("session_id") @db.Uuid
+  /// HMAC of the code; the code itself is never stored.
+  codeHash   String    @map("code_hash")
+  expiresAt  DateTime  @map("expires_at")
+  attempts   Int       @default(0)
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  session PlatformSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+  @@map("platform_otp_challenge")
+  @@schema("platform")
+}
+
+// ===================================================================================
+// Platform: tenants, plans, entitlements
+// ===================================================================================
+
+enum TenantStatus {
+  PENDING_APPROVAL
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+
+  @@schema("platform")
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  GRACE
+  SUSPENDED
+  CANCELLED
+
+  @@schema("platform")
+}
+
+enum FeatureType {
+  BOOLEAN
+  QUOTA
+  CONFIG
+
+  @@schema("platform")
+}
+
+enum PlanStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+
+  @@schema("platform")
+}
+
+enum SupportAccessMode {
+  READ_ONLY
+
+  @@schema("platform")
+}
+
+model Tenant {
+  id           String       @id @default(uuid()) @db.Uuid
+  slug         String       @unique
+  legalName    String       @map("legal_name")
+  displayName  String       @map("display_name")
+  status       TenantStatus @default(ACTIVE)
+  statusReason String?      @map("status_reason")
+  /// ISO 3166-1 alpha-2.
+  country      String       @default("IN")
+  timezone     String       @default("Asia/Kolkata")
+  /// ISO 4217.
+  currency     String       @default("INR")
+  locale       String       @default("en-IN")
+  approvedAt   DateTime?    @map("approved_at")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  subscription        TenantSubscription?
+  overrides           SubscriptionOverride[]
+  usageCounters       UsageCounter[]
+  supportSessions     SupportSession[]
+  memberships         TenantMembership[]
+  roleAssignments     RoleAssignment[]
+  branches            Branch[]
+  invitations         Invitation[]
+  settings            TenantSettings?
+  auditLogs           AuditLog[]
+  outbox              Outbox[]
+  idempotency         IdempotencyRecord[]
+  counters            TenantCounter[]
+  files               FileRecord[]
+  members             MemberProfile[]
+  plans               MembershipPlan[]
+  coupons             Coupon[]
+  invoiceSeries       InvoiceSeries[]
+  notifications       Notification[]
+  notificationPrefs   NotificationPreference[]
+  emailTemplates      EmailTemplate[]
+  dataJobs            DataJob[]
+  classCategories     ClassCategory[]
+  ptPackages          PtPackage[]
+  paymentIntegrations PaymentIntegration[]
+  reconciliationRuns  ReconciliationRun[]
+  platformInvoices    PlatformInvoice[]
+  platformPayments    PlatformPayment[]
+  dunningAttempts     DunningAttempt[]
+  leadStages          LeadStage[]
+  leadSources         LeadSource[]
+  lostReasons         LostReason[]
+  campaigns           Campaign[]
+  leads               Lead[]
+  leadCaptureForms    LeadCaptureForm[]
+  apiKeys             TenantApiKey[]
+  leadSavedViews      LeadSavedView[]
+  eventConsumptions   EventConsumption[]
+  whatsappAccounts    WhatsAppAccount[]
+  suppressions        SuppressionRecord[]
+  segments            Segment[]
+  automationWorkflows AutomationWorkflow[]
+  retentionRules      RetentionRule[]
+  retentionFlags      RetentionFlag[]
+  exercises           Exercise[]
+  workoutTemplates    WorkoutTemplate[]
+  foodItems           FoodItem[]
+  gymAnnouncements    GymAnnouncement[]
+  achievements        Achievement[]
+  challenges          Challenge[]
+  rewardRules         RewardRule[]
+  rewardPerks         RewardPerk[]
+  metricDays          MetricDaily[]
+  aiRequests          AiRequestLog[]
+
+  @@index([status])
+  @@map("tenant")
+  @@schema("platform")
+}
+
+model Feature {
+  /// e.g. "branches.max", "classes.enabled".
+  key          String      @id
+  type         FeatureType
+  module       String
+  description  String
+  /// Value when a plan does not list the feature. QUOTA: number, or null = unlimited.
+  defaultValue Json?       @map("default_value")
+  createdAt    DateTime    @default(now()) @map("created_at")
+
+  planFeatures PlanFeature[]
+  overrides    SubscriptionOverride[]
+
+  @@map("feature")
+  @@schema("platform")
+}
+
+/// Plans are versioned: editing a live plan means creating code@version+1, so existing
+/// subscribers keep the terms they signed up for.
+model SaasPlan {
+  id                String     @id @default(uuid()) @db.Uuid
+  code              String
+  version           Int
+  name              String
+  description       String?
+  status            PlanStatus @default(DRAFT)
+  /// Filled in M4 (SaaS billing).
+  priceMonthlyMinor BigInt?    @map("price_monthly_minor")
+  currency          String     @default("INR")
+  createdAt         DateTime   @default(now()) @map("created_at")
+  updatedAt         DateTime   @updatedAt @map("updated_at")
+
+  features      PlanFeature[]
+  subscriptions TenantSubscription[]
+  prices        SaasPlanPrice[]
+
+  @@unique([code, version])
+  @@map("saas_plan")
+  @@schema("platform")
+}
+
+model PlanFeature {
+  planId     String @map("plan_id") @db.Uuid
+  featureKey String @map("feature_key")
+  /// BOOLEAN: true/false. QUOTA: integer, or null = unlimited. CONFIG: any JSON.
+  value      Json?
+
+  plan    SaasPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+  feature Feature  @relation(fields: [featureKey], references: [key])
+
+  @@id([planId, featureKey])
+  @@map("plan_feature")
+  @@schema("platform")
+}
+
+model TenantSubscription {
+  id                     String             @id @default(uuid()) @db.Uuid
+  tenantId               String             @unique @map("tenant_id") @db.Uuid
+  planId                 String             @map("plan_id") @db.Uuid
+  status                 SubscriptionStatus @default(TRIALING)
+  trialEndsAt            DateTime?          @map("trial_ends_at")
+  /// Filled in M4 (SaaS billing).
+  currentPeriodEnd       DateTime?          @map("current_period_end")
+  // --- M4: provider subscription and dunning
+  currentPeriodStart     DateTime?          @map("current_period_start")
+  priceId                String?            @map("price_id") @db.Uuid
+  providerSubscriptionId String?            @unique @map("provider_subscription_id")
+  /// Provider's own status (created, authenticated, active, pending, halted, …).
+  providerStatus         String?            @map("provider_status")
+  cancelAtPeriodEnd      Boolean            @default(false) @map("cancel_at_period_end")
+  pastDueAt              DateTime?          @map("past_due_at")
+  graceEndsAt            DateTime?          @map("grace_ends_at")
+  /// Downgrade booked for the end of the period.
+  pendingPlanId          String?            @map("pending_plan_id") @db.Uuid
+  pendingPriceId         String?            @map("pending_price_id") @db.Uuid
+  lastPaymentAt          DateTime?          @map("last_payment_at")
+  createdAt              DateTime           @default(now()) @map("created_at")
+  updatedAt              DateTime           @updatedAt @map("updated_at")
+
+  tenant Tenant         @relation(fields: [tenantId], references: [id])
+  plan   SaasPlan       @relation(fields: [planId], references: [id])
+  price  SaasPlanPrice? @relation("SubscriptionPrice", fields: [priceId], references: [id])
+
+  @@index([status, trialEndsAt])
+  @@map("tenant_subscription")
+  @@schema("platform")
+}
+
+/// Per-tenant exception to the plan, e.g. 5 extra branches until 31 March.
+model SubscriptionOverride {
+  id          String    @id @default(uuid()) @db.Uuid
+  tenantId    String    @map("tenant_id") @db.Uuid
+  featureKey  String    @map("feature_key")
+  value       Json?
+  reason      String
+  expiresAt   DateTime? @map("expires_at")
+  createdById String?   @map("created_by_id") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id])
+  feature Feature @relation(fields: [featureKey], references: [key])
+
+  @@index([tenantId, featureKey])
+  @@map("subscription_override")
+  @@schema("platform")
+}
+
+/// Running totals for QUOTA features, updated in the same transaction as the change they count.
+/// The platform admin reads these instead of the tenant's own tables.
+model UsageCounter {
+  tenantId  String   @map("tenant_id") @db.Uuid
+  key       String
+  value     Int      @default(0)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@id([tenantId, key])
+  @@map("usage_counter")
+  @@schema("platform")
+}
+
+model PlatformAuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  tenantId   String?  @map("tenant_id") @db.Uuid
+  before     Json?
+  after      Json?
+  meta       Json?
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  actor PlatformUser? @relation(fields: [actorId], references: [id])
+
+  @@index([createdAt])
+  @@index([tenantId, createdAt])
+  @@index([action])
+  @@map("platform_audit_log")
+  @@schema("platform")
+}
+
+model PlatformSetting {
+  key         String   @id
+  value       Json
+  updatedById String?  @map("updated_by_id") @db.Uuid
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("platform_setting")
+  @@schema("platform")
+}
+
+/// Time-boxed, audited, read-only access by platform support to one tenant.
+model SupportSession {
+  id             String            @id @default(uuid()) @db.Uuid
+  tenantId       String            @map("tenant_id") @db.Uuid
+  platformUserId String            @map("platform_user_id") @db.Uuid
+  reason         String
+  mode           SupportAccessMode @default(READ_ONLY)
+  expiresAt      DateTime          @map("expires_at")
+  endedAt        DateTime?         @map("ended_at")
+  createdAt      DateTime          @default(now()) @map("created_at")
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id])
+  platformUser PlatformUser @relation(fields: [platformUserId], references: [id])
+
+  @@index([tenantId, expiresAt])
+  @@map("support_session")
+  @@schema("platform")
+}
+
+// ===================================================================================
+// Tenant realm: global identity (no tenant_id, no RLS). One User per email (D-04).
+// ===================================================================================
+
+enum UserStatus {
+  ACTIVE
+  DEACTIVATED
+
+  @@schema("app")
+}
+
+model User {
+  id            String     @id @default(uuid()) @db.Uuid
+  name          String
+  email         String     @unique
+  emailVerified Boolean    @default(false) @map("email_verified")
+  image         String?
+  status        UserStatus @default(ACTIVE)
+  deactivatedAt DateTime?  @map("deactivated_at")
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+
+  sessions       Session[]
+  accounts       Account[]
+  trustedDevices TrustedDevice[]
+  memberships    TenantMembership[]
+
+  @@map("user")
+  @@schema("app")
+}
+
+model Session {
+  id             String    @id @default(uuid()) @db.Uuid
+  token          String    @unique
+  userId         String    @map("user_id") @db.Uuid
+  expiresAt      DateTime  @map("expires_at")
+  ipAddress      String?   @map("ip_address")
+  userAgent      String?   @map("user_agent")
+  /// The tenant the user picked. Re-verified against TenantMembership on every request.
+  activeTenantId String?   @map("active_tenant_id") @db.Uuid
+  activeBranchId String?   @map("active_branch_id") @db.Uuid
+  /// Set when the email OTP second factor passes (or a trusted device skips it).
+  mfaVerifiedAt  DateTime? @map("mfa_verified_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  otpChallenges OtpChallenge[]
+
+  @@index([userId])
+  @@map("session")
+  @@schema("app")
+}
+
+model Account {
+  id                    String    @id @default(uuid()) @db.Uuid
+  accountId             String    @map("account_id")
+  providerId            String    @map("provider_id")
+  userId                String    @map("user_id") @db.Uuid
+  accessToken           String?   @map("access_token")
+  refreshToken          String?   @map("refresh_token")
+  idToken               String?   @map("id_token")
+  accessTokenExpiresAt  DateTime? @map("access_token_expires_at")
+  refreshTokenExpiresAt DateTime? @map("refresh_token_expires_at")
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("account")
+  @@schema("app")
+}
+
+model Verification {
+  id         String   @id @default(uuid()) @db.Uuid
+  identifier String
+  value      String
+  expiresAt  DateTime @map("expires_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@index([identifier])
+  @@map("verification")
+  @@schema("app")
+}
+
+model OtpChallenge {
+  id         String    @id @default(uuid()) @db.Uuid
+  sessionId  String    @map("session_id") @db.Uuid
+  /// HMAC of the code; the code itself is never stored.
+  codeHash   String    @map("code_hash")
+  expiresAt  DateTime  @map("expires_at")
+  attempts   Int       @default(0)
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+  @@map("otp_challenge")
+  @@schema("app")
+}
+
+/// "Remember this device for 30 days" (staff below administrator only, D-03).
+model TrustedDevice {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  tokenHash  String   @unique @map("token_hash")
+  userAgent  String?  @map("user_agent")
+  expiresAt  DateTime @map("expires_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+  lastUsedAt DateTime @default(now()) @map("last_used_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("trusted_device")
+  @@schema("app")
+}
+
+// ===================================================================================
+// Tenant-owned tables (tenant_id + RLS + registry entry)
+// ===================================================================================
+
+enum MembershipStatus {
+  ACTIVE
+  DEACTIVATED
+
+  @@schema("app")
+}
+
+enum BranchStatus {
+  ACTIVE
+  ARCHIVED
+
+  @@schema("app")
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+
+  @@schema("app")
+}
+
+enum AuditActorType {
+  USER
+  SYSTEM
+  PLATFORM
+
+  @@schema("app")
+}
+
+enum OutboxStatus {
+  PENDING
+  DONE
+  FAILED
+
+  @@schema("app")
+}
+
+/// Links a global User to a tenant. Roles hang off it.
+model TenantMembership {
+  id            String           @id @default(uuid()) @db.Uuid
+  tenantId      String           @map("tenant_id") @db.Uuid
+  userId        String           @map("user_id") @db.Uuid
+  status        MembershipStatus @default(ACTIVE)
+  deactivatedAt DateTime?        @map("deactivated_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+
+  tenant         Tenant              @relation(fields: [tenantId], references: [id])
+  user           User                @relation(fields: [userId], references: [id])
+  roles          RoleAssignment[]
+  staffProfile   StaffProfile?
+  trainerProfile TrainerProfile?
+  availability   StaffAvailability[]
+
+  @@unique([tenantId, userId])
+  @@unique([tenantId, id])
+  @@index([userId])
+  @@map("tenant_membership")
+  @@schema("app")
+}
+
+/// One fixed role (D-07) for a membership. branchId null = every branch.
+model RoleAssignment {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  membershipId String   @map("membership_id") @db.Uuid
+  /// A key from packages/auth/src/permissions.ts (TENANT_ROLES). A string so custom roles fit later.
+  roleKey      String   @map("role_key")
+  branchId     String?  @map("branch_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant     Tenant           @relation(fields: [tenantId], references: [id])
+  // Composite keys: a role can only point at a membership and branch of the same tenant.
+  membership TenantMembership @relation(fields: [tenantId, membershipId], references: [tenantId, id], onDelete: Cascade)
+  branch     Branch?          @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Restrict)
+
+  @@index([tenantId, membershipId])
+  @@map("role_assignment")
+  @@schema("app")
+}
+
+model Branch {
+  id              String       @id @default(uuid()) @db.Uuid
+  tenantId        String       @map("tenant_id") @db.Uuid
+  name            String
+  /// Short code, unique per tenant, e.g. "JPR-1".
+  code            String
+  addressLine1    String?      @map("address_line1")
+  addressLine2    String?      @map("address_line2")
+  city            String?
+  /// GST state code, e.g. "08" (Rajasthan).
+  stateCode       String       @map("state_code")
+  postalCode      String?      @map("postal_code")
+  phone           String?
+  /// Overrides the tenant timezone when set.
+  timezone        String?
+  /// Branch's own GSTIN when it is registered separately from the tenant.
+  gstin           String?
+  status          BranchStatus @default(ACTIVE)
+  /// M3: members also check out at this branch (D-09: optional per branch).
+  checkoutEnabled Boolean      @default(false) @map("checkout_enabled")
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+
+  tenant          Tenant                 @relation(fields: [tenantId], references: [id])
+  roleAssignments RoleAssignment[]
+  members         MemberProfile[]
+  planBranches    PlanBranch[]
+  memberships     Membership[]
+  invoices        GymInvoice[]
+  payments        GymPayment[]
+  scanDevices     ScanDevice[]
+  attendance      AttendanceEvent[]
+  rooms           Room[]
+  classTemplates  ClassTemplate[]
+  classSessions   ClassSession[]
+  ptBalances      PtPackageBalance[]
+  ptAppointments  PtAppointment[]
+  availability    StaffAvailability[]
+  paymentLinks    PaymentLink[]
+  leads           Lead[]
+  followUpTasks   FollowUpTask[]
+  trials          TrialBooking[]
+  leadForms       LeadCaptureForm[]
+  apiKeys         TenantApiKey[]
+  leadCursor      LeadAssignmentCursor[]
+  metricDays      MetricDaily[]
+
+  @@unique([tenantId, code])
+  @@unique([tenantId, id])
+  @@index([tenantId, status])
+  @@map("branch")
+  @@schema("app")
+}
+
+model Invitation {
+  id                      String           @id @default(uuid()) @db.Uuid
+  tenantId                String           @map("tenant_id") @db.Uuid
+  email                   String
+  /// [{ roleKey, branchId | null }], validated with Zod in packages/core.
+  roles                   Json
+  /// SHA-256 of the token in the emailed link.
+  tokenHash               String           @unique @map("token_hash")
+  status                  InvitationStatus @default(PENDING)
+  expiresAt               DateTime         @map("expires_at")
+  invitedByUserId         String?          @map("invited_by_user_id") @db.Uuid
+  /// Set when the platform admin invited the owner of a platform-created tenant.
+  invitedByPlatformUserId String?          @map("invited_by_platform_user_id") @db.Uuid
+  acceptedAt              DateTime?        @map("accepted_at")
+  acceptedUserId          String?          @map("accepted_user_id") @db.Uuid
+  /// Member app invites (M2): accepting links this member profile to the account.
+  memberId                String?          @map("member_id") @db.Uuid
+  createdAt               DateTime         @default(now()) @map("created_at")
+  updatedAt               DateTime         @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, status])
+  @@index([tenantId, email])
+  @@map("invitation")
+  @@schema("app")
+}
+
+model TenantSettings {
+  tenantId                     String               @id @map("tenant_id") @db.Uuid
+  gstRegistered                Boolean              @default(false) @map("gst_registered")
+  gstin                        String?
+  /// GST state code of the registered business, e.g. "27" (Maharashtra).
+  stateCode                    String?              @map("state_code")
+  pricesIncludeTax             Boolean              @default(true) @map("prices_include_tax")
+  require2faForStaff           Boolean              @default(false) @map("require_2fa_for_staff")
+  /// S3 object key of the uploaded logo.
+  logoKey                      String?              @map("logo_key")
+  // --- M2: billing and membership policies
+  /// Up to 4 characters, e.g. "IT" → IT/25-26/00001.
+  invoicePrefix                String               @default("INV") @map("invoice_prefix")
+  invoiceDueDays               Int                  @default(0) @map("invoice_due_days")
+  defaultSacCode               String               @default("999723") @map("default_sac_code")
+  placeOfSupplyRule            PlaceOfSupplyRule    @default(BRANCH_STATE) @map("place_of_supply_rule")
+  membershipActivation         MembershipActivation @default(FULL_PAYMENT) @map("membership_activation")
+  autoApplyCredit              Boolean              @default(true) @map("auto_apply_credit")
+  /// Days before expiry to remind members, e.g. {7,3,1}.
+  expiryReminderDays           Int[]                @default([7, 3, 1]) @map("expiry_reminder_days")
+  memberSelfSignup             Boolean              @default(false) @map("member_self_signup")
+  memberJoinApproval           Boolean              @default(true) @map("member_join_approval")
+  // --- M3: floor operations
+  /// A second check-in within this many minutes is refused as a duplicate.
+  checkinDuplicateMinutes      Int                  @default(2) @map("checkin_duplicate_minutes")
+  /// What a scan does when the member owes money.
+  duesAtCheckin                DuesCheckinPolicy    @default(WARN) @map("dues_at_checkin")
+  /// A check-in marks the member's booked classes at that branch today as attended.
+  autoMarkClassAttendance      Boolean              @default(true) @map("auto_mark_class_attendance")
+  bookingReminderHours         Int                  @default(2) @map("booking_reminder_hours")
+  /// Cancelling after the cutoff keeps the class credit used (late cancel).
+  lateCancelForfeitsCredit     Boolean              @default(true) @map("late_cancel_forfeits_credit")
+  /// A PT no-show uses up a session from the package.
+  ptNoShowConsumesSession      Boolean              @default(true) @map("pt_no_show_consumes_session")
+  /// PT sessions cancelled closer than this to the start count as no-shows.
+  ptCancelCutoffHours          Int                  @default(12) @map("pt_cancel_cutoff_hours")
+  // --- M4: online payments, refunds, dues
+  /// Payment links expire after this many days.
+  paymentLinkExpiryDays        Int                  @default(7) @map("payment_link_expiry_days")
+  /// Members may pay part of a balance online; the minimum first part (paise).
+  onlinePartialAllowed         Boolean              @default(true) @map("online_partial_allowed")
+  onlineMinPartialMinor        BigInt               @default(50000) @map("online_min_partial_minor")
+  /// Refunds above this need a second person's approval; null = never.
+  refundApprovalThresholdMinor BigInt?              @map("refund_approval_threshold_minor")
+  /// Days overdue on which members get a dues reminder.
+  duesReminderDays             Int[]                @default([1, 7, 14, 30]) @map("dues_reminder_days")
+  createdAt                    DateTime             @default(now()) @map("created_at")
+  updatedAt                    DateTime             @updatedAt @map("updated_at")
+
+  tenant                        Tenant             @relation(fields: [tenantId], references: [id])
+  // --- M5: CRM
+  /// MANUAL, or ROUND_ROBIN among the branch's sales staff.
+  leadAssignment                LeadAssignmentMode @default(MANUAL) @map("lead_assignment")
+  /// A first-contact task is due this many minutes after a lead arrives.
+  leadFirstContactMinutes       Int                @default(15) @map("lead_first_contact_minutes")
+  /// Reminder this many minutes before a follow-up task is due.
+  taskReminderMinutes           Int                @default(30) @map("task_reminder_minutes")
+  // --- M6: messaging
+  /// Inbound words that opt a contact out (case-insensitive, whole message).
+  optOutKeywords                String[]           @default(["stop", "unsubscribe", "stop all", "cancel", "end", "quit", "opt out", "optout", "band karo", "band", "rok do", "mat bhejo", "nahi chahiye", "बंद", "बंद करो", "रोको"]) @map("opt_out_keywords")
+  optInKeywords                 String[]           @default(["start", "subscribe", "shuru", "chalu"]) @map("opt_in_keywords")
+  /// Automated marketing messages per member per day (all workflows together).
+  marketingDailyCap             Int                @default(1) @map("marketing_daily_cap")
+  /// Notification key → {template, language, variables}: which approved template sends it on WhatsApp.
+  whatsappNotificationTemplates Json?              @map("whatsapp_notification_templates")
+  // --- M7: engagement
+  /// A week counts for the streak with at least this many days with a check-in.
+  streakVisitsPerWeek           Int                @default(2) @map("streak_visits_per_week")
+  /// After a membership expires, the streak survives this many days (then it resets).
+  streakGraceDays               Int                @default(14) @map("streak_grace_days")
+  /// What one reward point is worth when redeemed as member credit, in paise.
+  rewardPointValueMinor         Int                @default(50) @map("reward_point_value_minor")
+  rewardMinRedeemPoints         Int                @default(200) @map("reward_min_redeem_points")
+  /// Visit points: at most this many rewarded visit days per week (rest days stay rewarded-neutral).
+  rewardVisitWeeklyCap          Int                @default(5) @map("reward_visit_weekly_cap")
+  // --- M8: KPIs
+  /// Renewal / churn / reactivation: a new membership within this many days of the end still counts as a renewal.
+  kpiGraceDays                  Int                @default(7) @map("kpi_grace_days")
+
+  @@map("tenant_settings")
+  @@schema("app")
+}
+
+model AuditLog {
+  id                  String         @id @default(uuid()) @db.Uuid
+  tenantId            String         @map("tenant_id") @db.Uuid
+  actorType           AuditActorType @map("actor_type")
+  actorUserId         String?        @map("actor_user_id") @db.Uuid
+  actorPlatformUserId String?        @map("actor_platform_user_id") @db.Uuid
+  action              String
+  entityType          String         @map("entity_type")
+  entityId            String?        @map("entity_id")
+  branchId            String?        @map("branch_id") @db.Uuid
+  before              Json?
+  after               Json?
+  meta                Json?
+  ipAddress           String?        @map("ip_address")
+  userAgent           String?        @map("user_agent")
+  createdAt           DateTime       @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, action])
+  @@index([tenantId, entityType, entityId])
+  @@map("audit_log")
+  @@schema("app")
+}
+
+/// Transactional outbox: written in the same transaction as the change, delivered by the worker.
+model Outbox {
+  id          String       @id @default(uuid()) @db.Uuid
+  tenantId    String       @map("tenant_id") @db.Uuid
+  topic       String
+  payload     Json
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  availableAt DateTime     @default(now()) @map("available_at")
+  lastError   String?      @map("last_error")
+  createdAt   DateTime     @default(now()) @map("created_at")
+  processedAt DateTime?    @map("processed_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, status])
+  @@index([status, availableAt])
+  @@map("outbox")
+  @@schema("app")
+}
+
+/// Remembers the result of a request so a retried request does not run twice.
+model IdempotencyRecord {
+  tenantId    String   @map("tenant_id") @db.Uuid
+  scope       String
+  key         String
+  requestHash String   @map("request_hash")
+  response    Json?
+  createdAt   DateTime @default(now()) @map("created_at")
+  expiresAt   DateTime @map("expires_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@id([tenantId, scope, key])
+  @@map("idempotency_record")
+  @@schema("app")
+}
+
+// ===================================================================================
+// M2: members, plans, memberships, invoices, payments, notifications
+// Root entities reference Tenant directly; children use composite (tenantId, parentId) FKs,
+// which both carry the tenant FK and stop cross-tenant links.
+// ===================================================================================
+
+enum MemberStatus {
+  PENDING_APPROVAL
+  ACTIVE
+  ARCHIVED
+
+  @@schema("app")
+}
+
+enum MemberSource {
+  STAFF
+  WALK_IN
+  SELF_SIGNUP
+  IMPORT
+  REFERRAL
+
+  @@schema("app")
+}
+
+enum Gender {
+  FEMALE
+  MALE
+  OTHER
+  UNDISCLOSED
+
+  @@schema("app")
+}
+
+enum NoteVisibility {
+  STAFF
+  MANAGEMENT
+
+  @@schema("app")
+}
+
+enum FilePurpose {
+  MEMBER_DOCUMENT
+  PAYMENT_PROOF
+  INVOICE_PDF
+  EXPORT
+  IMPORT
+  MEMBER_PHOTO
+  CERTIFICATE
+
+  @@schema("app")
+}
+
+enum ScanStatus {
+  PENDING
+  CLEAN
+  INFECTED
+  SKIPPED
+
+  @@schema("app")
+}
+
+enum ConsentChannel {
+  EMAIL
+  WHATSAPP
+  SMS
+
+  @@schema("app")
+}
+
+enum ConsentPurpose {
+  SERVICE
+  MARKETING
+
+  @@schema("app")
+}
+
+enum ConsentStatus {
+  GRANTED
+  REVOKED
+
+  @@schema("app")
+}
+
+enum ConsentMethod {
+  STAFF_FORM
+  SELF_SERVICE
+  SIGNUP
+  IMPORT
+  WEB_FORM
+  API
+  INBOUND_KEYWORD
+
+  @@schema("app")
+}
+
+enum DurationUnit {
+  DAY
+  MONTH
+  YEAR
+
+  @@schema("app")
+}
+
+enum AccessScope {
+  ALL_BRANCHES
+  HOME_BRANCH
+  LISTED_BRANCHES
+
+  @@schema("app")
+}
+
+enum MembershipPlanStatus {
+  ACTIVE
+  ARCHIVED
+
+  @@schema("app")
+}
+
+enum RefundRule {
+  NONE
+  PRORATA
+  FULL_BEFORE_START
+
+  @@schema("app")
+}
+
+enum CouponKind {
+  PERCENT
+  FLAT
+
+  @@schema("app")
+}
+
+enum CouponStatus {
+  ACTIVE
+  ARCHIVED
+
+  @@schema("app")
+}
+
+enum MembershipState {
+  PENDING_PAYMENT
+  ACTIVE
+  PAUSED
+  EXPIRED
+  CANCELLED
+
+  @@schema("app")
+}
+
+enum MembershipEventType {
+  CREATED
+  ACTIVATED
+  RENEWED
+  EXTENDED
+  FROZEN
+  UNFROZEN
+  CANCELLED
+  EXPIRED
+
+  @@schema("app")
+}
+
+enum InvoiceStatus {
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  VOID
+  PARTIALLY_REFUNDED
+  REFUNDED
+
+  @@schema("app")
+}
+
+/// TAX_INVOICE for GST-registered suppliers, BILL ("Bill / Receipt") for unregistered ones (D-11).
+enum InvoiceDocType {
+  TAX_INVOICE
+  BILL
+
+  @@schema("app")
+}
+
+enum InvoiceLineKind {
+  MEMBERSHIP
+  JOINING_FEE
+  OTHER
+  PT_PACKAGE
+
+  @@schema("app")
+}
+
+enum SeriesKind {
+  INVOICE
+  CREDIT_NOTE
+  RECEIPT
+
+  @@schema("app")
+}
+
+enum PaymentMethod {
+  CASH
+  UPI
+  BANK_TRANSFER
+  CARD_TERMINAL
+  CHEQUE
+  OTHER
+  ONLINE
+
+  @@schema("app")
+}
+
+enum PaymentStatus {
+  SUCCEEDED
+  VOID
+
+  @@schema("app")
+}
+
+enum AllocationSource {
+  PAYMENT
+  CREDIT
+
+  @@schema("app")
+}
+
+enum CreditEntryKind {
+  OVERPAYMENT
+  APPLIED
+  ALLOCATION_REVERSED
+  PAYMENT_VOID
+  MANUAL_REFUND
+  ADJUSTMENT
+  ONLINE_REFUND
+  REFUND_REVERSED
+  /// M7: reward points turned into credit.
+  REWARD
+
+  @@schema("app")
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+
+  @@schema("app")
+}
+
+enum NotificationCategory {
+  SERVICE
+  MARKETING
+
+  @@schema("app")
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+
+  @@schema("app")
+}
+
+enum DataJobKind {
+  MEMBER_IMPORT
+  MEMBER_EXPORT
+  LEAD_IMPORT
+  LEAD_EXPORT
+  REPORT_EXPORT
+
+  @@schema("app")
+}
+
+enum DataJobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+
+  @@schema("app")
+}
+
+enum MembershipActivation {
+  FULL_PAYMENT
+  ANY_PAYMENT
+  IMMEDIATE
+
+  @@schema("app")
+}
+
+enum PlaceOfSupplyRule {
+  BRANCH_STATE
+  MEMBER_STATE
+
+  @@schema("app")
+}
+
+/// Per-tenant counters (member codes). Updated with a row lock, so codes never repeat.
+model TenantCounter {
+  tenantId String @map("tenant_id") @db.Uuid
+  key      String
+  value    Int    @default(0)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@id([tenantId, key])
+  @@map("tenant_counter")
+  @@schema("app")
+}
+
+model FileRecord {
+  id               String      @id @default(uuid()) @db.Uuid
+  tenantId         String      @map("tenant_id") @db.Uuid
+  key              String      @unique
+  filename         String
+  contentType      String      @map("content_type")
+  size             Int
+  purpose          FilePurpose
+  scanStatus       ScanStatus  @default(PENDING) @map("scan_status")
+  uploadedByUserId String?     @map("uploaded_by_user_id") @db.Uuid
+  /// Exports and imports are deleted after this.
+  expiresAt        DateTime?   @map("expires_at")
+  createdAt        DateTime    @default(now()) @map("created_at")
+
+  tenant         Tenant                 @relation(fields: [tenantId], references: [id])
+  documents      MemberDocument[]
+  memberPhotos   MemberProfile[]        @relation("MemberPhoto")
+  certifications TrainerCertification[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, purpose])
+  @@map("file_record")
+  @@schema("app")
+}
+
+model MemberProfile {
+  id                   String       @id @default(uuid()) @db.Uuid
+  tenantId             String       @map("tenant_id") @db.Uuid
+  homeBranchId         String       @map("home_branch_id") @db.Uuid
+  /// Set once the member has an app account (D-04: global User).
+  userId               String?      @map("user_id") @db.Uuid
+  /// Human-friendly, unique per tenant, e.g. M-000123.
+  memberCode           String       @map("member_code")
+  firstName            String       @map("first_name")
+  lastName             String?      @map("last_name")
+  email                String?
+  /// E.164. Collected, not verified in v1 (D-03).
+  phone                String?
+  phoneVerifiedAt      DateTime?    @map("phone_verified_at")
+  dateOfBirth          DateTime?    @map("date_of_birth") @db.Date
+  gender               Gender?
+  addressLine1         String?      @map("address_line1")
+  city                 String?
+  /// GST state code, for place-of-supply when the tenant uses MEMBER_STATE.
+  stateCode            String?      @map("state_code")
+  postalCode           String?      @map("postal_code")
+  emergencyName        String?      @map("emergency_name")
+  emergencyPhone       String?      @map("emergency_phone")
+  /// M3: shown on the digital card and the scan result (visual identity check).
+  photoFileId          String?      @map("photo_file_id") @db.Uuid
+  /// M4: privacy notice accepted in the member app (version shown).
+  privacyAcceptedAt    DateTime?    @map("privacy_accepted_at")
+  privacyNoticeVersion String?      @map("privacy_notice_version")
+  /// Personal fields wiped on a deletion request; financial records kept (law).
+  anonymizedAt         DateTime?    @map("anonymized_at")
+  status               MemberStatus @default(ACTIVE)
+  source               MemberSource @default(STAFF)
+  tags                 String[]     @default([])
+  joinedAt             DateTime     @default(now()) @map("joined_at")
+  archivedAt           DateTime?    @map("archived_at")
+  createdAt            DateTime     @default(now()) @map("created_at")
+  updatedAt            DateTime     @updatedAt @map("updated_at")
+
+  tenant             Tenant                    @relation(fields: [tenantId], references: [id])
+  homeBranch         Branch                    @relation(fields: [tenantId, homeBranchId], references: [tenantId, id])
+  notes              MemberNote[]
+  documents          MemberDocument[]
+  consents           ContactConsent[]
+  memberships        Membership[]
+  invoices           GymInvoice[]
+  payments           GymPayment[]
+  creditEntries      MemberCreditEntry[]
+  photo              FileRecord?               @relation("MemberPhoto", fields: [tenantId, photoFileId], references: [tenantId, id])
+  passes             MemberPass[]
+  attendance         AttendanceEvent[]
+  bookings           Booking[]
+  waitlist           WaitlistEntry[]
+  trainers           TrainerClientAssignment[]
+  ptBalances         PtPackageBalance[]
+  ptAppointments     PtAppointment[]
+  entitlementEntries EntitlementLedger[]
+  paymentLinks       PaymentLink[]
+  refunds            Refund[]
+  dataRequests       MemberDataRequest[]
+  convertedLeads     Lead[]                    @relation("LeadConvertedMember")
+  followUpTasks      FollowUpTask[]
+  conversations      Conversation[]
+  // --- M7
+  healthConsents     HealthDataConsent[]
+  workoutPlans       WorkoutPlan[]
+  workoutLogs        WorkoutLog[]
+  personalRecords    PersonalRecord[]
+  assessments        FitnessAssessment[]
+  goals              MemberGoal[]
+  nutritionPlans     NutritionPlan[]
+  foodLogs           FoodLog[]
+  waterLogs          WaterLog[]
+  trainerFeedback    TrainerFeedback[]
+  streak             StreakState?
+  achievements       MemberAchievement[]
+  challengeEntries   ChallengeParticipant[]
+  rewardEntries      RewardLedger[]
+  rewardRedemptions  RewardRedemption[]
+  referralCode       ReferralCode?
+  referralsMade      Referral[]                @relation("ReferralReferrer")
+  referredBy         Referral[]                @relation("ReferralReferred")
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, memberCode])
+  @@unique([tenantId, userId])
+  @@index([tenantId, status])
+  @@index([tenantId, homeBranchId])
+  @@index([tenantId, phone])
+  @@index([tenantId, email])
+  @@map("member_profile")
+  @@schema("app")
+}
+
+model MemberNote {
+  id           String         @id @default(uuid()) @db.Uuid
+  tenantId     String         @map("tenant_id") @db.Uuid
+  memberId     String         @map("member_id") @db.Uuid
+  authorUserId String         @map("author_user_id") @db.Uuid
+  body         String
+  visibility   NoteVisibility @default(STAFF)
+  createdAt    DateTime       @default(now()) @map("created_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@index([tenantId, memberId, createdAt])
+  @@map("member_note")
+  @@schema("app")
+}
+
+model MemberDocument {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  memberId  String   @map("member_id") @db.Uuid
+  fileId    String   @map("file_id") @db.Uuid
+  title     String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  file   FileRecord    @relation(fields: [tenantId, fileId], references: [tenantId, id])
+
+  @@index([tenantId, memberId])
+  @@map("member_document")
+  @@schema("app")
+}
+
+/// Append-only consent history; the latest row per (member, channel, purpose) is current.
+model ContactConsent {
+  id               String         @id @default(uuid()) @db.Uuid
+  tenantId         String         @map("tenant_id") @db.Uuid
+  memberId         String?        @map("member_id") @db.Uuid
+  channel          ConsentChannel
+  purpose          ConsentPurpose
+  status           ConsentStatus
+  method           ConsentMethod
+  capturedByUserId String?        @map("captured_by_user_id") @db.Uuid
+  capturedAt       DateTime       @default(now()) @map("captured_at")
+  /// What the person saw or said, e.g. the checkbox text.
+  evidence         String?
+
+  member MemberProfile? @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  leadId String?        @map("lead_id") @db.Uuid
+  lead   Lead?          @relation(fields: [tenantId, leadId], references: [tenantId, id])
+
+  @@index([tenantId, memberId, channel, purpose, capturedAt])
+  @@map("contact_consent")
+  @@schema("app")
+}
+
+model MembershipPlan {
+  id                 String               @id @default(uuid()) @db.Uuid
+  tenantId           String               @map("tenant_id") @db.Uuid
+  /// Stable across versions; editing a sold plan creates code@version+1.
+  code               String
+  version            Int                  @default(1)
+  name               String
+  description        String?
+  priceMinor         BigInt               @map("price_minor")
+  joiningFeeMinor    BigInt               @default(0) @map("joining_fee_minor")
+  currency           String               @default("INR")
+  durationUnit       DurationUnit         @map("duration_unit")
+  durationCount      Int                  @map("duration_count")
+  taxRateBps         Int                  @default(1800) @map("tax_rate_bps")
+  sacCode            String               @default("999723") @map("sac_code")
+  isTrial            Boolean              @default(false) @map("is_trial")
+  accessScope        AccessScope          @default(HOME_BRANCH) @map("access_scope")
+  /// [{ days: [1..7], from: "06:00", to: "22:00" }] or null = any time. Enforced from M3.
+  accessWindows      Json?                @map("access_windows")
+  /// { classCredits?: number | null, ptSessions?: number | null }. Consumed from M3.
+  entitlements       Json                 @default("{}")
+  freezeMaxDays      Int                  @default(0) @map("freeze_max_days")
+  freezeMaxTimes     Int                  @default(0) @map("freeze_max_times")
+  freezeFeeMinor     BigInt               @default(0) @map("freeze_fee_minor")
+  graceDays          Int                  @default(0) @map("grace_days")
+  allowAddOn         Boolean              @default(false) @map("allow_add_on")
+  refundRule         RefundRule           @default(NONE) @map("refund_rule")
+  cancellationPolicy String?              @map("cancellation_policy")
+  /// M4: members may buy this plan in the app.
+  onlinePurchase     Boolean              @default(false) @map("online_purchase")
+  status             MembershipPlanStatus @default(ACTIVE)
+  createdAt          DateTime             @default(now()) @map("created_at")
+  updatedAt          DateTime             @updatedAt @map("updated_at")
+
+  tenant      Tenant       @relation(fields: [tenantId], references: [id])
+  branches    PlanBranch[]
+  memberships Membership[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, code, version])
+  @@index([tenantId, status])
+  @@map("membership_plan")
+  @@schema("app")
+}
+
+/// Where a plan is sold, and (for LISTED_BRANCHES) where it grants access.
+model PlanBranch {
+  tenantId String @map("tenant_id") @db.Uuid
+  planId   String @map("plan_id") @db.Uuid
+  branchId String @map("branch_id") @db.Uuid
+
+  plan   MembershipPlan @relation(fields: [tenantId, planId], references: [tenantId, id], onDelete: Cascade)
+  branch Branch         @relation(fields: [tenantId, branchId], references: [tenantId, id])
+
+  @@id([tenantId, planId, branchId])
+  @@map("plan_branch")
+  @@schema("app")
+}
+
+model Coupon {
+  id             String       @id @default(uuid()) @db.Uuid
+  tenantId       String       @map("tenant_id") @db.Uuid
+  /// Upper-case, unique per tenant.
+  code           String
+  kind           CouponKind
+  /// PERCENT: basis points (1000 = 10%). FLAT: paise.
+  value          Int
+  validFrom      DateTime?    @map("valid_from") @db.Date
+  validTo        DateTime?    @map("valid_to") @db.Date
+  maxRedemptions Int?         @map("max_redemptions")
+  redemptions    Int          @default(0)
+  /// Plan codes it applies to; empty = every plan.
+  planCodes      String[]     @default([]) @map("plan_codes")
+  status         CouponStatus @default(ACTIVE)
+  createdAt      DateTime     @default(now()) @map("created_at")
+
+  tenant      Tenant       @relation(fields: [tenantId], references: [id])
+  memberships Membership[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, code])
+  @@map("coupon")
+  @@schema("app")
+}
+
+model Membership {
+  id            String          @id @default(uuid()) @db.Uuid
+  tenantId      String          @map("tenant_id") @db.Uuid
+  memberId      String          @map("member_id") @db.Uuid
+  planId        String          @map("plan_id") @db.Uuid
+  /// Branch where it was sold.
+  branchId      String          @map("branch_id") @db.Uuid
+  status        MembershipState
+  /// Local dates in the tenant timezone; the membership covers [startDate, endDate] inclusive.
+  startDate     DateTime        @map("start_date") @db.Date
+  endDate       DateTime        @map("end_date") @db.Date
+  priceMinor    BigInt          @map("price_minor")
+  discountMinor BigInt          @default(0) @map("discount_minor")
+  couponId      String?         @map("coupon_id") @db.Uuid
+  renewedFromId String?         @map("renewed_from_id") @db.Uuid
+  frozenDays    Int             @default(0) @map("frozen_days")
+  freezeCount   Int             @default(0) @map("freeze_count")
+  activatedAt   DateTime?       @map("activated_at")
+  cancelledAt   DateTime?       @map("cancelled_at")
+  cancelReason  String?         @map("cancel_reason")
+  createdById   String?         @map("created_by_id") @db.Uuid
+  createdAt     DateTime        @default(now()) @map("created_at")
+  updatedAt     DateTime        @updatedAt @map("updated_at")
+
+  member             MemberProfile       @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  plan               MembershipPlan      @relation(fields: [tenantId, planId], references: [tenantId, id])
+  branch             Branch              @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  coupon             Coupon?             @relation(fields: [tenantId, couponId], references: [tenantId, id])
+  events             MembershipEvent[]
+  freezes            MembershipFreeze[]
+  invoices           GymInvoice[]
+  bookings           Booking[]
+  entitlementEntries EntitlementLedger[]
+  /// M5: the lead this sale converted (lead becomes WON when it activates).
+  leadId             String?             @map("lead_id") @db.Uuid
+  lead               Lead?               @relation("MembershipLead", fields: [tenantId, leadId], references: [tenantId, id])
+  convertedLeads     Lead[]              @relation("LeadConvertedMembership")
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId])
+  @@index([tenantId, status, endDate])
+  @@map("membership")
+  @@schema("app")
+}
+
+model MembershipEvent {
+  id           String              @id @default(uuid()) @db.Uuid
+  tenantId     String              @map("tenant_id") @db.Uuid
+  membershipId String              @map("membership_id") @db.Uuid
+  type         MembershipEventType
+  fromStatus   MembershipState?    @map("from_status")
+  toStatus     MembershipState?    @map("to_status")
+  data         Json?
+  actorUserId  String?             @map("actor_user_id") @db.Uuid
+  createdAt    DateTime            @default(now()) @map("created_at")
+
+  membership Membership @relation(fields: [tenantId, membershipId], references: [tenantId, id])
+
+  @@index([tenantId, membershipId, createdAt])
+  @@map("membership_event")
+  @@schema("app")
+}
+
+model MembershipFreeze {
+  id           String    @id @default(uuid()) @db.Uuid
+  tenantId     String    @map("tenant_id") @db.Uuid
+  membershipId String    @map("membership_id") @db.Uuid
+  startDate    DateTime  @map("start_date") @db.Date
+  /// Planned last frozen day; the freeze may end early.
+  endDate      DateTime  @map("end_date") @db.Date
+  days         Int
+  reason       String
+  endedAt      DateTime? @map("ended_at")
+  createdById  String?   @map("created_by_id") @db.Uuid
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  membership Membership @relation(fields: [tenantId, membershipId], references: [tenantId, id])
+
+  @@index([tenantId, membershipId])
+  @@map("membership_freeze")
+  @@schema("app")
+}
+
+/// Gap-free numbering: one row per (kind, GSTIN or tenant, financial year), locked FOR UPDATE
+/// inside the issuing transaction.
+model InvoiceSeries {
+  id            String     @id @default(uuid()) @db.Uuid
+  tenantId      String     @map("tenant_id") @db.Uuid
+  kind          SeriesKind
+  /// The supplier GSTIN, or "UNREGISTERED".
+  seriesKey     String     @map("series_key")
+  financialYear String     @map("financial_year")
+  prefix        String
+  nextNumber    Int        @default(1) @map("next_number")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, kind, seriesKey, financialYear])
+  @@map("invoice_series")
+  @@schema("app")
+}
+
+model GymInvoice {
+  id               String         @id @default(uuid()) @db.Uuid
+  tenantId         String         @map("tenant_id") @db.Uuid
+  branchId         String         @map("branch_id") @db.Uuid
+  memberId         String         @map("member_id") @db.Uuid
+  membershipId     String?        @map("membership_id") @db.Uuid
+  number           String
+  documentType     InvoiceDocType @map("document_type")
+  status           InvoiceStatus  @default(ISSUED)
+  /// Local date in the tenant timezone.
+  issueDate        DateTime       @map("issue_date") @db.Date
+  dueDate          DateTime       @map("due_date") @db.Date
+  currency         String         @default("INR")
+  pricesIncludeTax Boolean        @map("prices_include_tax")
+  /// GST state code used for place of supply.
+  placeOfSupply    String?        @map("place_of_supply")
+  taxableMinor     BigInt         @map("taxable_minor")
+  cgstMinor        BigInt         @default(0) @map("cgst_minor")
+  sgstMinor        BigInt         @default(0) @map("sgst_minor")
+  igstMinor        BigInt         @default(0) @map("igst_minor")
+  totalMinor       BigInt         @map("total_minor")
+  /// Snapshots at issue time, so the document never changes (legal name, GSTIN, address, state).
+  supplier         Json
+  recipient        Json
+  notes            String?
+  pdfFileId        String?        @map("pdf_file_id") @db.Uuid
+  voidedAt         DateTime?      @map("voided_at")
+  voidReason       String?        @map("void_reason")
+  createdById      String?        @map("created_by_id") @db.Uuid
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  member       MemberProfile        @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  branch       Branch               @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  membership   Membership?          @relation(fields: [tenantId, membershipId], references: [tenantId, id])
+  lines        GymInvoiceLine[]
+  allocations  PaymentAllocation[]
+  creditNotes  CreditNote[]
+  ptBalances   PtPackageBalance[]
+  linkInvoices PaymentLinkInvoice[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, number])
+  @@index([tenantId, memberId])
+  @@index([tenantId, status, dueDate])
+  @@index([tenantId, issueDate])
+  @@map("gym_invoice")
+  @@schema("app")
+}
+
+model GymInvoiceLine {
+  id             String          @id @default(uuid()) @db.Uuid
+  tenantId       String          @map("tenant_id") @db.Uuid
+  invoiceId      String          @map("invoice_id") @db.Uuid
+  position       Int
+  kind           InvoiceLineKind
+  description    String
+  sacCode        String?         @map("sac_code")
+  quantity       Int             @default(1)
+  /// Price as entered (incl. or excl. tax per the invoice), before discount.
+  unitPriceMinor BigInt          @map("unit_price_minor")
+  discountMinor  BigInt          @default(0) @map("discount_minor")
+  taxableMinor   BigInt          @map("taxable_minor")
+  taxRateBps     Int             @map("tax_rate_bps")
+  cgstRateBps    Int             @default(0) @map("cgst_rate_bps")
+  sgstRateBps    Int             @default(0) @map("sgst_rate_bps")
+  igstRateBps    Int             @default(0) @map("igst_rate_bps")
+  cgstMinor      BigInt          @default(0) @map("cgst_minor")
+  sgstMinor      BigInt          @default(0) @map("sgst_minor")
+  igstMinor      BigInt          @default(0) @map("igst_minor")
+  totalMinor     BigInt          @map("total_minor")
+
+  invoice GymInvoice @relation(fields: [tenantId, invoiceId], references: [tenantId, id])
+
+  @@index([tenantId, invoiceId])
+  @@map("gym_invoice_line")
+  @@schema("app")
+}
+
+/// Corrections and cancellations of an issued invoice (which itself never changes).
+model CreditNote {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  invoiceId    String   @map("invoice_id") @db.Uuid
+  number       String
+  issueDate    DateTime @map("issue_date") @db.Date
+  reason       String
+  taxableMinor BigInt   @map("taxable_minor")
+  cgstMinor    BigInt   @default(0) @map("cgst_minor")
+  sgstMinor    BigInt   @default(0) @map("sgst_minor")
+  igstMinor    BigInt   @default(0) @map("igst_minor")
+  totalMinor   BigInt   @map("total_minor")
+  createdById  String?  @map("created_by_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  invoice GymInvoice       @relation(fields: [tenantId, invoiceId], references: [tenantId, id])
+  lines   CreditNoteLine[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, number])
+  @@index([tenantId, invoiceId])
+  @@index([tenantId, issueDate])
+  @@map("credit_note")
+  @@schema("app")
+}
+
+model CreditNoteLine {
+  id           String @id @default(uuid()) @db.Uuid
+  tenantId     String @map("tenant_id") @db.Uuid
+  creditNoteId String @map("credit_note_id") @db.Uuid
+  description  String
+  taxableMinor BigInt @map("taxable_minor")
+  cgstMinor    BigInt @default(0) @map("cgst_minor")
+  sgstMinor    BigInt @default(0) @map("sgst_minor")
+  igstMinor    BigInt @default(0) @map("igst_minor")
+  totalMinor   BigInt @map("total_minor")
+
+  creditNote CreditNote @relation(fields: [tenantId, creditNoteId], references: [tenantId, id])
+
+  @@index([tenantId, creditNoteId])
+  @@map("credit_note_line")
+  @@schema("app")
+}
+
+model GymPayment {
+  id                String        @id @default(uuid()) @db.Uuid
+  tenantId          String        @map("tenant_id") @db.Uuid
+  branchId          String        @map("branch_id") @db.Uuid
+  memberId          String        @map("member_id") @db.Uuid
+  method            PaymentMethod
+  amountMinor       BigInt        @map("amount_minor")
+  currency          String        @default("INR")
+  reference         String?
+  receivedAt        DateTime      @map("received_at")
+  receivedByUserId  String?       @map("received_by_user_id") @db.Uuid
+  status            PaymentStatus @default(SUCCEEDED)
+  receiptNumber     String        @map("receipt_number")
+  proofFileId       String?       @map("proof_file_id") @db.Uuid
+  notes             String?
+  voidedAt          DateTime?     @map("voided_at")
+  voidReason        String?       @map("void_reason")
+  voidedById        String?       @map("voided_by_id") @db.Uuid
+  /// M4: online payments — the provider's payment id (one payment row per provider payment).
+  providerPaymentId String?       @map("provider_payment_id")
+  paymentLinkId     String?       @map("payment_link_id") @db.Uuid
+  createdAt         DateTime      @default(now()) @map("created_at")
+
+  member      MemberProfile       @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  branch      Branch              @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  link        PaymentLink?        @relation(fields: [tenantId, paymentLinkId], references: [tenantId, id])
+  allocations PaymentAllocation[]
+  refunds     Refund[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, receiptNumber])
+  @@unique([tenantId, providerPaymentId])
+  @@index([tenantId, memberId])
+  @@index([tenantId, receivedAt])
+  @@map("gym_payment")
+  @@schema("app")
+}
+
+/// How a payment (or member credit) is spread over invoices. Reversed, never deleted.
+model PaymentAllocation {
+  id          String           @id @default(uuid()) @db.Uuid
+  tenantId    String           @map("tenant_id") @db.Uuid
+  invoiceId   String           @map("invoice_id") @db.Uuid
+  source      AllocationSource
+  paymentId   String?          @map("payment_id") @db.Uuid
+  amountMinor BigInt           @map("amount_minor")
+  reversedAt  DateTime?        @map("reversed_at")
+  createdById String?          @map("created_by_id") @db.Uuid
+  createdAt   DateTime         @default(now()) @map("created_at")
+
+  invoice GymInvoice  @relation(fields: [tenantId, invoiceId], references: [tenantId, id])
+  payment GymPayment? @relation(fields: [tenantId, paymentId], references: [tenantId, id])
+
+  @@index([tenantId, invoiceId])
+  @@index([tenantId, paymentId])
+  @@map("payment_allocation")
+  @@schema("app")
+}
+
+/// Member credit ledger (D-10): the balance is the sum, never a stored column.
+model MemberCreditEntry {
+  id          String          @id @default(uuid()) @db.Uuid
+  tenantId    String          @map("tenant_id") @db.Uuid
+  memberId    String          @map("member_id") @db.Uuid
+  /// Positive adds credit, negative uses it.
+  amountMinor BigInt          @map("amount_minor")
+  kind        CreditEntryKind
+  paymentId   String?         @map("payment_id") @db.Uuid
+  invoiceId   String?         @map("invoice_id") @db.Uuid
+  note        String?
+  createdById String?         @map("created_by_id") @db.Uuid
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@index([tenantId, memberId])
+  @@map("member_credit_entry")
+  @@schema("app")
+}
+
+/// One row per recipient per channel. EMAIL rows are delivered by the worker (via the outbox).
+model Notification {
+  id          String               @id @default(uuid()) @db.Uuid
+  tenantId    String               @map("tenant_id") @db.Uuid
+  /// The global user (staff or member app account); null for email-only recipients.
+  userId      String?              @map("user_id") @db.Uuid
+  memberId    String?              @map("member_id") @db.Uuid
+  email       String?
+  channel     NotificationChannel
+  category    NotificationCategory
+  templateKey String               @map("template_key")
+  title       String
+  body        String
+  link        String?
+  status      DeliveryStatus       @default(PENDING)
+  /// Why it was skipped or failed (no consent, opted out, provider error).
+  statusNote  String?              @map("status_note")
+  /// Stops duplicates, e.g. "expiring:<membershipId>:7".
+  dedupeKey   String?              @map("dedupe_key")
+  readAt      DateTime?            @map("read_at")
+  sentAt      DateTime?            @map("sent_at")
+  createdAt   DateTime             @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, channel, dedupeKey])
+  @@index([tenantId, userId, channel, readAt])
+  @@index([tenantId, memberId])
+  @@map("notification")
+  @@schema("app")
+}
+
+model NotificationPreference {
+  tenantId    String              @map("tenant_id") @db.Uuid
+  userId      String              @map("user_id") @db.Uuid
+  templateKey String              @map("template_key")
+  channel     NotificationChannel
+  enabled     Boolean
+  updatedAt   DateTime            @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@id([tenantId, userId, templateKey, channel])
+  @@map("notification_preference")
+  @@schema("app")
+}
+
+/// Tenant overrides of the built-in email templates (packages/core/src/notifications).
+model EmailTemplate {
+  tenantId    String   @map("tenant_id") @db.Uuid
+  key         String
+  subject     String
+  body        String
+  updatedById String?  @map("updated_by_id") @db.Uuid
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@id([tenantId, key])
+  @@map("email_template")
+  @@schema("app")
+}
+
+model DataJob {
+  id           String        @id @default(uuid()) @db.Uuid
+  tenantId     String        @map("tenant_id") @db.Uuid
+  kind         DataJobKind
+  status       DataJobStatus @default(PENDING)
+  dryRun       Boolean       @default(false) @map("dry_run")
+  inputFileId  String?       @map("input_file_id") @db.Uuid
+  resultFileId String?       @map("result_file_id") @db.Uuid
+  /// Row counts, per-row errors (capped), filters used.
+  summary      Json?
+  params       Json?
+  createdById  String        @map("created_by_id") @db.Uuid
+  createdAt    DateTime      @default(now()) @map("created_at")
+  finishedAt   DateTime?     @map("finished_at")
+
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+  /// 0–100 while running (report exports).
+  progress Int    @default(0)
+
+  @@index([tenantId, createdAt])
+  @@map("data_job")
+  @@schema("app")
+}
+
+// ===================================================================================
+// M3: floor operations — member passes and check-in (D-09), classes and bookings,
+// staff and trainer profiles, availability, client assignments, PT packages.
+// ===================================================================================
+
+enum PassStatus {
+  ACTIVE
+  REVOKED
+
+  @@schema("app")
+}
+
+enum AttendanceType {
+  CHECK_IN
+  CHECK_OUT
+
+  @@schema("app")
+}
+
+enum AttendanceMethod {
+  QR
+  MANUAL
+  CORRECTION
+
+  @@schema("app")
+}
+
+enum AttendanceResult {
+  ACCEPTED
+  REJECTED
+
+  @@schema("app")
+}
+
+enum DuesCheckinPolicy {
+  WARN
+  BLOCK
+
+  @@schema("app")
+}
+
+/// Lifecycle of configuration records (devices, rooms, categories, class templates, PT packages).
+enum RecordStatus {
+  ACTIVE
+  ARCHIVED
+
+  @@schema("app")
+}
+
+enum ClassSessionStatus {
+  SCHEDULED
+  CANCELLED
+  COMPLETED
+
+  @@schema("app")
+}
+
+enum BookingStatus {
+  BOOKED
+  CANCELLED
+  ATTENDED
+  NO_SHOW
+
+  @@schema("app")
+}
+
+enum BookingSource {
+  MEMBER_APP
+  STAFF
+  WAITLIST
+
+  @@schema("app")
+}
+
+enum WaitlistStatus {
+  WAITING
+  PROMOTED
+  LEFT
+  SKIPPED
+  EXPIRED
+
+  @@schema("app")
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+
+  @@schema("app")
+}
+
+enum PayBasis {
+  MONTHLY
+  HOURLY
+  PER_SESSION
+
+  @@schema("app")
+}
+
+enum AvailabilityKind {
+  WEEKLY
+  EXCEPTION
+
+  @@schema("app")
+}
+
+enum PtBalanceStatus {
+  PENDING_PAYMENT
+  ACTIVE
+  EXHAUSTED
+  EXPIRED
+  CANCELLED
+
+  @@schema("app")
+}
+
+enum PtAppointmentStatus {
+  SCHEDULED
+  COMPLETED
+  NO_SHOW
+  CANCELLED
+
+  @@schema("app")
+}
+
+enum EntitlementKind {
+  CLASS_CREDIT
+  PT_SESSION
+
+  @@schema("app")
+}
+
+enum EntitlementReason {
+  GRANT
+  BOOKING
+  BOOKING_RETURNED
+  SESSION_COMPLETED
+  SESSION_NO_SHOW
+  ADJUSTMENT
+  EXPIRED
+
+  @@schema("app")
+}
+
+/// The member's digital pass. The QR shows passId.timeStep.mac (packages/core/src/attendance/pass-code.ts).
+model MemberPass {
+  id              String     @id @default(uuid()) @db.Uuid
+  tenantId        String     @map("tenant_id") @db.Uuid
+  memberId        String     @map("member_id") @db.Uuid
+  /// Opaque random id printed in the QR (no personal data). Unique across tenants.
+  passId          String     @unique @map("pass_id")
+  /// 32 random bytes sealed with the data-encryption key (packages/core/src/crypto).
+  secretEncrypted String     @map("secret_encrypted")
+  status          PassStatus @default(ACTIVE)
+  issuedAt        DateTime   @default(now()) @map("issued_at")
+  issuedById      String?    @map("issued_by_id") @db.Uuid
+  revokedAt       DateTime?  @map("revoked_at")
+  revokedById     String?    @map("revoked_by_id") @db.Uuid
+  revokedReason   String?    @map("revoked_reason")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId])
+  @@map("member_pass")
+  @@schema("app")
+}
+
+/// A named scanner (reception tablet, phone) at a branch. Optional: scans also work without one.
+model ScanDevice {
+  id          String       @id @default(uuid()) @db.Uuid
+  tenantId    String       @map("tenant_id") @db.Uuid
+  branchId    String       @map("branch_id") @db.Uuid
+  name        String
+  status      RecordStatus @default(ACTIVE)
+  lastSeenAt  DateTime?    @map("last_seen_at")
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdAt   DateTime     @default(now()) @map("created_at")
+
+  branch Branch            @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  events AttendanceEvent[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, branchId, name])
+  @@map("scan_device")
+  @@schema("app")
+}
+
+/// Every scan (accepted or rejected) and every manual check-in or check-out. Never deleted:
+/// corrections void a record or move its time, with a reason, and are audited.
+model AttendanceEvent {
+  id                 String           @id @default(uuid()) @db.Uuid
+  tenantId           String           @map("tenant_id") @db.Uuid
+  branchId           String           @map("branch_id") @db.Uuid
+  /// Null when the scanned pass is unknown.
+  memberId           String?          @map("member_id") @db.Uuid
+  type               AttendanceType   @default(CHECK_IN)
+  method             AttendanceMethod
+  result             AttendanceResult
+  /// Why a scan was refused, e.g. CODE_ALREADY_USED, MEMBERSHIP_EXPIRED.
+  rejectCode         String?          @map("reject_code")
+  passId             String?          @map("pass_id")
+  timeStep           Int?             @map("time_step")
+  scannedByUserId    String?          @map("scanned_by_user_id") @db.Uuid
+  deviceId           String?          @map("device_id") @db.Uuid
+  /// Required for manual check-ins, overrides and corrections.
+  reason             String?
+  /// Checked in although a rule refused it (attendance.override).
+  overridden         Boolean          @default(false)
+  occurredAt         DateTime         @default(now()) @map("occurred_at")
+  originalOccurredAt DateTime?        @map("original_occurred_at")
+  correctedAt        DateTime?        @map("corrected_at")
+  correctedById      String?          @map("corrected_by_id") @db.Uuid
+  voidedAt           DateTime?        @map("voided_at")
+  voidedById         String?          @map("voided_by_id") @db.Uuid
+  voidReason         String?          @map("void_reason")
+  createdAt          DateTime         @default(now()) @map("created_at")
+
+  branch Branch         @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  member MemberProfile? @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  device ScanDevice?    @relation(fields: [tenantId, deviceId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, branchId, occurredAt])
+  @@index([tenantId, memberId, occurredAt])
+  @@map("attendance_event")
+  @@schema("app")
+}
+
+model ClassCategory {
+  id        String       @id @default(uuid()) @db.Uuid
+  tenantId  String       @map("tenant_id") @db.Uuid
+  name      String
+  /// Hex colour for the calendar.
+  color     String       @default("#204289")
+  status    RecordStatus @default(ACTIVE)
+  createdAt DateTime     @default(now()) @map("created_at")
+
+  tenant    Tenant          @relation(fields: [tenantId], references: [id])
+  templates ClassTemplate[]
+  sessions  ClassSession[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, name])
+  @@map("class_category")
+  @@schema("app")
+}
+
+model Room {
+  id        String       @id @default(uuid()) @db.Uuid
+  tenantId  String       @map("tenant_id") @db.Uuid
+  branchId  String       @map("branch_id") @db.Uuid
+  name      String
+  capacity  Int?
+  status    RecordStatus @default(ACTIVE)
+  createdAt DateTime     @default(now()) @map("created_at")
+
+  branch    Branch          @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  templates ClassTemplate[]
+  sessions  ClassSession[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, branchId, name])
+  @@map("room")
+  @@schema("app")
+}
+
+/// A recurring class. Sessions are materialized 8 weeks ahead by the worker.
+/// Recurrence is a weekly RRULE subset: BYDAY days, from startDate, until untilDate or COUNT.
+model ClassTemplate {
+  id                   String       @id @default(uuid()) @db.Uuid
+  tenantId             String       @map("tenant_id") @db.Uuid
+  branchId             String       @map("branch_id") @db.Uuid
+  categoryId           String?      @map("category_id") @db.Uuid
+  name                 String
+  description          String?
+  trainerId            String?      @map("trainer_id") @db.Uuid
+  roomId               String?      @map("room_id") @db.Uuid
+  capacity             Int
+  durationMinutes      Int          @map("duration_minutes")
+  /// Minutes after local midnight (branch timezone), e.g. 390 = 06:30.
+  startMinute          Int          @map("start_minute")
+  /// ISO weekdays 1 (Monday) .. 7 (Sunday).
+  byDays               Int[]        @map("by_days")
+  startDate            DateTime     @map("start_date") @db.Date
+  untilDate            DateTime?    @map("until_date") @db.Date
+  occurrenceCount      Int?         @map("occurrence_count")
+  /// Plan codes allowed to book; empty = any active membership.
+  eligiblePlanCodes    String[]     @default([]) @map("eligible_plan_codes")
+  bookingOpensHours    Int          @default(168) @map("booking_opens_hours")
+  bookingClosesMinutes Int          @default(0) @map("booking_closes_minutes")
+  cancelCutoffMinutes  Int          @default(120) @map("cancel_cutoff_minutes")
+  waitlistEnabled      Boolean      @default(true) @map("waitlist_enabled")
+  waitlistMax          Int?         @map("waitlist_max")
+  status               RecordStatus @default(ACTIVE)
+  /// Bumped on every change; sessions remember the version they were built from.
+  version              Int          @default(1)
+  createdById          String?      @map("created_by_id") @db.Uuid
+  createdAt            DateTime     @default(now()) @map("created_at")
+  updatedAt            DateTime     @updatedAt @map("updated_at")
+
+  branch   Branch          @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  category ClassCategory?  @relation(fields: [tenantId, categoryId], references: [tenantId, id])
+  trainer  TrainerProfile? @relation(fields: [tenantId, trainerId], references: [tenantId, id])
+  room     Room?           @relation(fields: [tenantId, roomId], references: [tenantId, id])
+  sessions ClassSession[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, branchId, status])
+  @@map("class_template")
+  @@schema("app")
+}
+
+/// One occurrence of a class (from a template, or a one-off). bookedCount is changed only by
+/// the conditional update in the booking service, never read-modify-write.
+model ClassSession {
+  id                   String             @id @default(uuid()) @db.Uuid
+  tenantId             String             @map("tenant_id") @db.Uuid
+  branchId             String             @map("branch_id") @db.Uuid
+  templateId           String?            @map("template_id") @db.Uuid
+  templateVersion      Int?               @map("template_version")
+  /// Local date of the occurrence; with templateId it makes materialization idempotent.
+  occurrenceDate       DateTime?          @map("occurrence_date") @db.Date
+  categoryId           String?            @map("category_id") @db.Uuid
+  name                 String
+  trainerId            String?            @map("trainer_id") @db.Uuid
+  roomId               String?            @map("room_id") @db.Uuid
+  startsAt             DateTime           @map("starts_at")
+  endsAt               DateTime           @map("ends_at")
+  capacity             Int
+  bookedCount          Int                @default(0) @map("booked_count")
+  eligiblePlanCodes    String[]           @default([]) @map("eligible_plan_codes")
+  bookingOpensHours    Int                @map("booking_opens_hours")
+  bookingClosesMinutes Int                @map("booking_closes_minutes")
+  cancelCutoffMinutes  Int                @map("cancel_cutoff_minutes")
+  waitlistEnabled      Boolean            @map("waitlist_enabled")
+  waitlistMax          Int?               @map("waitlist_max")
+  status               ClassSessionStatus @default(SCHEDULED)
+  /// Set when a template change could not be applied because the session has bookings.
+  conflictNote         String?            @map("conflict_note")
+  reminderSentAt       DateTime?          @map("reminder_sent_at")
+  cancelledAt          DateTime?          @map("cancelled_at")
+  cancelledById        String?            @map("cancelled_by_id") @db.Uuid
+  cancelReason         String?            @map("cancel_reason")
+  completedAt          DateTime?          @map("completed_at")
+  createdAt            DateTime           @default(now()) @map("created_at")
+  updatedAt            DateTime           @updatedAt @map("updated_at")
+
+  branch   Branch          @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  template ClassTemplate?  @relation(fields: [tenantId, templateId], references: [tenantId, id])
+  category ClassCategory?  @relation(fields: [tenantId, categoryId], references: [tenantId, id])
+  trainer  TrainerProfile? @relation(fields: [tenantId, trainerId], references: [tenantId, id])
+  room     Room?           @relation(fields: [tenantId, roomId], references: [tenantId, id])
+  bookings Booking[]
+  waitlist WaitlistEntry[]
+  trials   TrialBooking[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, templateId, occurrenceDate])
+  @@index([tenantId, branchId, startsAt])
+  @@index([tenantId, trainerId, startsAt])
+  @@index([tenantId, status, endsAt])
+  @@map("class_session")
+  @@schema("app")
+}
+
+model Booking {
+  id             String        @id @default(uuid()) @db.Uuid
+  tenantId       String        @map("tenant_id") @db.Uuid
+  sessionId      String        @map("session_id") @db.Uuid
+  memberId       String        @map("member_id") @db.Uuid
+  /// The membership that allowed the booking (and paid the credit, if the plan uses credits).
+  membershipId   String?       @map("membership_id") @db.Uuid
+  status         BookingStatus @default(BOOKED)
+  source         BookingSource
+  usedCredit     Boolean       @default(false) @map("used_credit")
+  /// Cancelled after the cancellation cutoff.
+  lateCancel     Boolean       @default(false) @map("late_cancel")
+  bookedById     String?       @map("booked_by_id") @db.Uuid
+  cancelledAt    DateTime?     @map("cancelled_at")
+  cancelledById  String?       @map("cancelled_by_id") @db.Uuid
+  cancelReason   String?       @map("cancel_reason")
+  markedAt       DateTime?     @map("marked_at")
+  markedById     String?       @map("marked_by_id") @db.Uuid
+  reminderSentAt DateTime?     @map("reminder_sent_at")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  session    ClassSession  @relation(fields: [tenantId, sessionId], references: [tenantId, id])
+  member     MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  membership Membership?   @relation(fields: [tenantId, membershipId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, sessionId, status])
+  @@index([tenantId, memberId, createdAt])
+  @@map("booking")
+  @@schema("app")
+}
+
+model WaitlistEntry {
+  id          String         @id @default(uuid()) @db.Uuid
+  tenantId    String         @map("tenant_id") @db.Uuid
+  sessionId   String         @map("session_id") @db.Uuid
+  memberId    String         @map("member_id") @db.Uuid
+  /// 1, 2, 3 … in joining order; promotion takes the lowest WAITING position.
+  position    Int
+  status      WaitlistStatus @default(WAITING)
+  bookingId   String?        @map("booking_id") @db.Uuid
+  /// Why an entry was skipped (no credit, membership ended).
+  note        String?
+  createdById String?        @map("created_by_id") @db.Uuid
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+
+  session ClassSession  @relation(fields: [tenantId, sessionId], references: [tenantId, id])
+  member  MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, sessionId, position])
+  @@map("waitlist_entry")
+  @@schema("app")
+}
+
+/// Staff details beyond the M1 account and roles. Pay fields need staff.compensation.view.
+model StaffProfile {
+  id             String          @id @default(uuid()) @db.Uuid
+  tenantId       String          @map("tenant_id") @db.Uuid
+  userId         String          @map("user_id") @db.Uuid
+  phone          String?
+  jobTitle       String?         @map("job_title")
+  employmentType EmploymentType? @map("employment_type")
+  startDate      DateTime?       @map("start_date") @db.Date
+  emergencyName  String?         @map("emergency_name")
+  emergencyPhone String?         @map("emergency_phone")
+  payBasis       PayBasis?       @map("pay_basis")
+  payRateMinor   BigInt?         @map("pay_rate_minor")
+  payNotes       String?         @map("pay_notes")
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+
+  membership TenantMembership @relation(fields: [tenantId, userId], references: [tenantId, userId])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, userId])
+  @@map("staff_profile")
+  @@schema("app")
+}
+
+model TrainerProfile {
+  id               String       @id @default(uuid()) @db.Uuid
+  tenantId         String       @map("tenant_id") @db.Uuid
+  userId           String       @map("user_id") @db.Uuid
+  displayName      String       @map("display_name")
+  specialties      String[]     @default([])
+  bio              String?
+  /// Shown to members in the class schedule and PT booking.
+  visibleToMembers Boolean      @default(true) @map("visible_to_members")
+  status           RecordStatus @default(ACTIVE)
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+
+  membership     TenantMembership          @relation(fields: [tenantId, userId], references: [tenantId, userId])
+  certifications TrainerCertification[]
+  templates      ClassTemplate[]
+  sessions       ClassSession[]
+  clients        TrainerClientAssignment[]
+  ptBalances     PtPackageBalance[]
+  appointments   PtAppointment[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, userId])
+  @@map("trainer_profile")
+  @@schema("app")
+}
+
+model TrainerCertification {
+  id        String    @id @default(uuid()) @db.Uuid
+  tenantId  String    @map("tenant_id") @db.Uuid
+  trainerId String    @map("trainer_id") @db.Uuid
+  title     String
+  issuer    String?
+  issuedOn  DateTime? @map("issued_on") @db.Date
+  expiresOn DateTime? @map("expires_on") @db.Date
+  fileId    String?   @map("file_id") @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  trainer TrainerProfile @relation(fields: [tenantId, trainerId], references: [tenantId, id], onDelete: Cascade)
+  file    FileRecord?    @relation(fields: [tenantId, fileId], references: [tenantId, id])
+
+  @@index([tenantId, trainerId])
+  @@map("trainer_certification")
+  @@schema("app")
+}
+
+/// Weekly working hours and dated exceptions (leave, extra hours), in the branch's local time.
+model StaffAvailability {
+  id          String           @id @default(uuid()) @db.Uuid
+  tenantId    String           @map("tenant_id") @db.Uuid
+  userId      String           @map("user_id") @db.Uuid
+  branchId    String?          @map("branch_id") @db.Uuid
+  kind        AvailabilityKind
+  /// WEEKLY: ISO weekday 1..7.
+  dayOfWeek   Int?             @map("day_of_week")
+  /// EXCEPTION: the local date.
+  date        DateTime?        @db.Date
+  /// Minutes after local midnight; [startMinute, endMinute).
+  startMinute Int              @map("start_minute")
+  endMinute   Int              @map("end_minute")
+  /// EXCEPTION only: false = not available (leave), true = extra hours.
+  available   Boolean          @default(true)
+  note        String?
+  createdAt   DateTime         @default(now()) @map("created_at")
+
+  membership TenantMembership @relation(fields: [tenantId, userId], references: [tenantId, userId], onDelete: Cascade)
+  branch     Branch?          @relation(fields: [tenantId, branchId], references: [tenantId, id])
+
+  @@index([tenantId, userId, kind])
+  @@map("staff_availability")
+  @@schema("app")
+}
+
+/// Trainer ↔ member, with history (ended rows stay).
+model TrainerClientAssignment {
+  id           String    @id @default(uuid()) @db.Uuid
+  tenantId     String    @map("tenant_id") @db.Uuid
+  trainerId    String    @map("trainer_id") @db.Uuid
+  memberId     String    @map("member_id") @db.Uuid
+  note         String?
+  startedAt    DateTime  @default(now()) @map("started_at")
+  assignedById String?   @map("assigned_by_id") @db.Uuid
+  endedAt      DateTime? @map("ended_at")
+  endedById    String?   @map("ended_by_id") @db.Uuid
+  endReason    String?   @map("end_reason")
+
+  trainer TrainerProfile @relation(fields: [tenantId, trainerId], references: [tenantId, id])
+  member  MemberProfile  @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@index([tenantId, trainerId])
+  @@index([tenantId, memberId])
+  @@map("trainer_client_assignment")
+  @@schema("app")
+}
+
+/// A personal-training package for sale (like a plan). Sold packages keep their own copy of the terms.
+model PtPackage {
+  id             String       @id @default(uuid()) @db.Uuid
+  tenantId       String       @map("tenant_id") @db.Uuid
+  code           String
+  name           String
+  description    String?
+  sessionCount   Int          @map("session_count")
+  validityDays   Int          @map("validity_days")
+  sessionMinutes Int          @default(60) @map("session_minutes")
+  priceMinor     BigInt       @map("price_minor")
+  currency       String       @default("INR")
+  taxRateBps     Int          @default(1800) @map("tax_rate_bps")
+  sacCode        String       @default("999723") @map("sac_code")
+  status         RecordStatus @default(ACTIVE)
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+
+  tenant   Tenant             @relation(fields: [tenantId], references: [id])
+  balances PtPackageBalance[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, code])
+  @@map("pt_package")
+  @@schema("app")
+}
+
+/// A sold PT package. Sessions left = the EntitlementLedger sum for this balance.
+model PtPackageBalance {
+  id             String          @id @default(uuid()) @db.Uuid
+  tenantId       String          @map("tenant_id") @db.Uuid
+  memberId       String          @map("member_id") @db.Uuid
+  packageId      String          @map("package_id") @db.Uuid
+  branchId       String          @map("branch_id") @db.Uuid
+  invoiceId      String?         @map("invoice_id") @db.Uuid
+  /// Preferred trainer, if one was chosen at sale.
+  trainerId      String?         @map("trainer_id") @db.Uuid
+  name           String
+  sessionsTotal  Int             @map("sessions_total")
+  sessionMinutes Int             @map("session_minutes")
+  validityDays   Int             @map("validity_days")
+  status         PtBalanceStatus @default(PENDING_PAYMENT)
+  activatedAt    DateTime?       @map("activated_at")
+  /// Last local date sessions can be used (set on activation).
+  expiresOn      DateTime?       @map("expires_on") @db.Date
+  cancelledAt    DateTime?       @map("cancelled_at")
+  createdById    String?         @map("created_by_id") @db.Uuid
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+
+  member       MemberProfile       @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  package      PtPackage           @relation(fields: [tenantId, packageId], references: [tenantId, id])
+  branch       Branch              @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  invoice      GymInvoice?         @relation(fields: [tenantId, invoiceId], references: [tenantId, id])
+  trainer      TrainerProfile?     @relation(fields: [tenantId, trainerId], references: [tenantId, id])
+  appointments PtAppointment[]
+  entries      EntitlementLedger[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId])
+  @@index([tenantId, invoiceId])
+  @@map("pt_package_balance")
+  @@schema("app")
+}
+
+model PtAppointment {
+  id            String              @id @default(uuid()) @db.Uuid
+  tenantId      String              @map("tenant_id") @db.Uuid
+  branchId      String              @map("branch_id") @db.Uuid
+  trainerId     String              @map("trainer_id") @db.Uuid
+  memberId      String              @map("member_id") @db.Uuid
+  balanceId     String              @map("balance_id") @db.Uuid
+  startsAt      DateTime            @map("starts_at")
+  endsAt        DateTime            @map("ends_at")
+  status        PtAppointmentStatus @default(SCHEDULED)
+  /// Trainer notes (no health data until the M7 health-data consent exists).
+  notes         String?
+  createdById   String?             @map("created_by_id") @db.Uuid
+  markedAt      DateTime?           @map("marked_at")
+  markedById    String?             @map("marked_by_id") @db.Uuid
+  cancelledAt   DateTime?           @map("cancelled_at")
+  cancelledById String?             @map("cancelled_by_id") @db.Uuid
+  cancelReason  String?             @map("cancel_reason")
+  createdAt     DateTime            @default(now()) @map("created_at")
+  updatedAt     DateTime            @updatedAt @map("updated_at")
+
+  branch  Branch           @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  trainer TrainerProfile   @relation(fields: [tenantId, trainerId], references: [tenantId, id])
+  member  MemberProfile    @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  balance PtPackageBalance @relation(fields: [tenantId, balanceId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, trainerId, startsAt])
+  @@index([tenantId, memberId, startsAt])
+  @@map("pt_appointment")
+  @@schema("app")
+}
+
+/// Class credits and PT sessions, granted and used. Append-only; a balance is always a sum.
+model EntitlementLedger {
+  id            String            @id @default(uuid()) @db.Uuid
+  tenantId      String            @map("tenant_id") @db.Uuid
+  memberId      String            @map("member_id") @db.Uuid
+  kind          EntitlementKind
+  /// CLASS_CREDIT: the membership whose plan grants the credits.
+  membershipId  String?           @map("membership_id") @db.Uuid
+  /// PT_SESSION: the package balance.
+  ptBalanceId   String?           @map("pt_balance_id") @db.Uuid
+  /// Positive grants, negative uses.
+  delta         Int
+  reason        EntitlementReason
+  bookingId     String?           @map("booking_id") @db.Uuid
+  appointmentId String?           @map("appointment_id") @db.Uuid
+  note          String?
+  createdById   String?           @map("created_by_id") @db.Uuid
+  createdAt     DateTime          @default(now()) @map("created_at")
+
+  member     MemberProfile     @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  membership Membership?       @relation(fields: [tenantId, membershipId], references: [tenantId, id])
+  ptBalance  PtPackageBalance? @relation(fields: [tenantId, ptBalanceId], references: [tenantId, id])
+
+  @@index([tenantId, membershipId])
+  @@index([tenantId, ptBalanceId])
+  @@index([tenantId, memberId, kind])
+  @@map("entitlement_ledger")
+  @@schema("app")
+}
+
+// ===================================================================================
+// M4: gym online payments (D-10) — tenant-owned, schema "app"
+// ===================================================================================
+
+enum PaymentProviderKind {
+  RAZORPAY
+  /// Development and tests only (PAYMENTS_FAKE_ENABLED); never in production.
+  FAKE
+
+  @@schema("app")
+}
+
+enum PaymentMode {
+  TEST
+  LIVE
+
+  @@schema("app")
+}
+
+enum IntegrationStatus {
+  ACTIVE
+  DISCONNECTED
+
+  @@schema("app")
+}
+
+enum PaymentLinkStatus {
+  CREATED
+  PARTIALLY_PAID
+  PAID
+  EXPIRED
+  CANCELLED
+
+  @@schema("app")
+}
+
+enum PaymentLinkPurpose {
+  /// Staff sent it for chosen invoices.
+  INVOICES
+  /// Member paid their balance in the app.
+  BALANCE
+  /// Member renewed in the app.
+  RENEWAL
+  /// Member bought a plan in the app.
+  PURCHASE
+
+  @@schema("app")
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+
+  @@schema("app")
+}
+
+enum RefundKind {
+  ONLINE
+  MANUAL
+
+  @@schema("app")
+}
+
+enum RefundStatus {
+  PENDING_APPROVAL
+  PENDING
+  PROCESSED
+  FAILED
+  REJECTED
+
+  @@schema("app")
+}
+
+enum ReconciliationKind {
+  QUICK
+  DAILY
+  MANUAL
+
+  @@schema("app")
+}
+
+enum ReconciliationItemStatus {
+  OPEN
+  RESOLVED
+
+  @@schema("app")
+}
+
+enum DataRequestKind {
+  EXPORT
+  DELETION
+
+  @@schema("app")
+}
+
+enum DataRequestStatus {
+  OPEN
+  DONE
+  REJECTED
+
+  @@schema("app")
+}
+
+/// A gym's own Razorpay account (D-10). Secrets sealed with DATA_ENCRYPTION_KEY, never sent to
+/// the browser; only the last 4 characters of the key secret are shown.
+model PaymentIntegration {
+  id               String              @id @default(uuid()) @db.Uuid
+  tenantId         String              @map("tenant_id") @db.Uuid
+  provider         PaymentProviderKind
+  mode             PaymentMode
+  keyId            String              @map("key_id")
+  keySecretEnc     String              @map("key_secret_enc")
+  webhookSecretEnc String              @map("webhook_secret_enc")
+  secretLast4      String              @map("secret_last4")
+  status           IntegrationStatus   @default(ACTIVE)
+  lastVerifiedAt   DateTime?           @map("last_verified_at")
+  connectedById    String?             @map("connected_by_id") @db.Uuid
+  disconnectedAt   DateTime?           @map("disconnected_at")
+  disconnectedById String?             @map("disconnected_by_id") @db.Uuid
+  createdAt        DateTime            @default(now()) @map("created_at")
+  updatedAt        DateTime            @updatedAt @map("updated_at")
+
+  tenant   Tenant         @relation(fields: [tenantId], references: [id])
+  links    PaymentLink[]
+  webhooks WebhookEvent[]
+
+  @@unique([tenantId, id])
+  @@map("payment_integration")
+  @@schema("app")
+}
+
+model PaymentLink {
+  id              String             @id @default(uuid()) @db.Uuid
+  tenantId        String             @map("tenant_id") @db.Uuid
+  integrationId   String             @map("integration_id") @db.Uuid
+  memberId        String             @map("member_id") @db.Uuid
+  branchId        String             @map("branch_id") @db.Uuid
+  /// Our id sent to the provider (≤ 40 chars); the provider refuses a second link with it.
+  referenceId     String             @unique @map("reference_id")
+  providerLinkId  String?            @map("provider_link_id")
+  purpose         PaymentLinkPurpose
+  amountMinor     BigInt             @map("amount_minor")
+  amountPaidMinor BigInt             @default(0) @map("amount_paid_minor")
+  currency        String             @default("INR")
+  acceptPartial   Boolean            @map("accept_partial")
+  minPartialMinor BigInt?            @map("min_partial_minor")
+  status          PaymentLinkStatus  @default(CREATED)
+  shortUrl        String?            @map("short_url")
+  expiresAt       DateTime?          @map("expires_at")
+  createdByUserId String?            @map("created_by_user_id") @db.Uuid
+  cancelledAt     DateTime?          @map("cancelled_at")
+  lastSyncedAt    DateTime?          @map("last_synced_at")
+  createdAt       DateTime           @default(now()) @map("created_at")
+  updatedAt       DateTime           @updatedAt @map("updated_at")
+
+  integration PaymentIntegration   @relation(fields: [tenantId, integrationId], references: [tenantId, id])
+  member      MemberProfile        @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  branch      Branch               @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  invoices    PaymentLinkInvoice[]
+  payments    GymPayment[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, providerLinkId])
+  @@index([tenantId, status])
+  @@index([tenantId, memberId])
+  @@map("payment_link")
+  @@schema("app")
+}
+
+/// Which invoices a link pays, in allocation order.
+model PaymentLinkInvoice {
+  tenantId  String @map("tenant_id") @db.Uuid
+  linkId    String @map("link_id") @db.Uuid
+  invoiceId String @map("invoice_id") @db.Uuid
+  position  Int
+
+  link    PaymentLink @relation(fields: [tenantId, linkId], references: [tenantId, id], onDelete: Cascade)
+  invoice GymInvoice  @relation(fields: [tenantId, invoiceId], references: [tenantId, id])
+
+  @@id([tenantId, linkId, invoiceId])
+  @@map("payment_link_invoice")
+  @@schema("app")
+}
+
+/// Every verified webhook, deduplicated by the provider's event id. Payloads are redacted.
+/// Forged (unsigned) requests are never written here.
+model WebhookEvent {
+  id            String        @id @default(uuid()) @db.Uuid
+  tenantId      String        @map("tenant_id") @db.Uuid
+  integrationId String        @map("integration_id") @db.Uuid
+  eventId       String        @map("event_id")
+  type          String
+  payload       Json
+  status        WebhookStatus @default(RECEIVED)
+  attempts      Int           @default(0)
+  error         String?
+  receivedAt    DateTime      @default(now()) @map("received_at")
+  processedAt   DateTime?     @map("processed_at")
+
+  integration PaymentIntegration @relation(fields: [tenantId, integrationId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@unique([integrationId, eventId])
+  @@index([tenantId, status, receivedAt])
+  @@map("webhook_event")
+  @@schema("app")
+}
+
+model Refund {
+  id               String         @id @default(uuid()) @db.Uuid
+  tenantId         String         @map("tenant_id") @db.Uuid
+  paymentId        String         @map("payment_id") @db.Uuid
+  memberId         String         @map("member_id") @db.Uuid
+  kind             RefundKind
+  amountMinor      BigInt         @map("amount_minor")
+  reason           String
+  status           RefundStatus
+  /// MANUAL: how the money was handed back.
+  method           PaymentMethod?
+  reference        String?
+  /// Our idempotency key at the provider (Razorpay `receipt`).
+  receipt          String         @unique
+  providerRefundId String?        @map("provider_refund_id")
+  creditNoteIds    String[]       @default([]) @map("credit_note_ids")
+  cancelMembership Boolean        @default(false) @map("cancel_membership")
+  requestedById    String?        @map("requested_by_id") @db.Uuid
+  approvedById     String?        @map("approved_by_id") @db.Uuid
+  decidedAt        DateTime?      @map("decided_at")
+  failureReason    String?        @map("failure_reason")
+  processedAt      DateTime?      @map("processed_at")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  payment GymPayment    @relation(fields: [tenantId, paymentId], references: [tenantId, id])
+  member  MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, status])
+  @@index([tenantId, paymentId])
+  @@index([tenantId, processedAt])
+  @@map("refund")
+  @@schema("app")
+}
+
+model ReconciliationRun {
+  id         String             @id @default(uuid()) @db.Uuid
+  tenantId   String             @map("tenant_id") @db.Uuid
+  kind       ReconciliationKind
+  startedAt  DateTime           @default(now()) @map("started_at")
+  finishedAt DateTime?          @map("finished_at")
+  checked    Int                @default(0)
+  fixed      Int                @default(0)
+  mismatches Int                @default(0)
+  error      String?
+
+  tenant Tenant               @relation(fields: [tenantId], references: [id])
+  items  ReconciliationItem[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, startedAt])
+  @@map("reconciliation_run")
+  @@schema("app")
+}
+
+model ReconciliationItem {
+  id           String                   @id @default(uuid()) @db.Uuid
+  tenantId     String                   @map("tenant_id") @db.Uuid
+  runId        String                   @map("run_id") @db.Uuid
+  /// LINK, PAYMENT or REFUND.
+  entity       String
+  entityId     String                   @map("entity_id") @db.Uuid
+  providerId   String?                  @map("provider_id")
+  issue        String
+  detail       Json?
+  status       ReconciliationItemStatus @default(OPEN)
+  resolvedAt   DateTime?                @map("resolved_at")
+  resolvedById String?                  @map("resolved_by_id") @db.Uuid
+  createdAt    DateTime                 @default(now()) @map("created_at")
+
+  run ReconciliationRun @relation(fields: [tenantId, runId], references: [tenantId, id])
+
+  @@index([tenantId, status])
+  @@map("reconciliation_item")
+  @@schema("app")
+}
+
+/// Member privacy requests (M4 launch minimum): data export and deletion (anonymisation).
+model MemberDataRequest {
+  id          String            @id @default(uuid()) @db.Uuid
+  tenantId    String            @map("tenant_id") @db.Uuid
+  memberId    String            @map("member_id") @db.Uuid
+  kind        DataRequestKind
+  status      DataRequestStatus @default(OPEN)
+  note        String?
+  handledById String?           @map("handled_by_id") @db.Uuid
+  handledAt   DateTime?         @map("handled_at")
+  createdAt   DateTime          @default(now()) @map("created_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@index([tenantId, status])
+  @@map("member_data_request")
+  @@schema("app")
+}
+
+// ===================================================================================
+// M4: SaaS billing (platform) — schema "platform", never touched by gym_app except reads
+// of public catalogue data and its own subscription row.
+// ===================================================================================
+
+enum BillingCycle {
+  MONTHLY
+  HALF_YEARLY
+  YEARLY
+
+  @@schema("platform")
+}
+
+enum PlatformInvoiceStatus {
+  ISSUED
+  PAID
+  VOID
+
+  @@schema("platform")
+}
+
+enum PlatformWebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+
+  @@schema("platform")
+}
+
+enum AnnouncementAudience {
+  ALL
+  PLANS
+  STATUSES
+
+  @@schema("platform")
+}
+
+/// Price of a plan version per billing cycle, mapped to the provider's plan id.
+model SaasPlanPrice {
+  id             String       @id @default(uuid()) @db.Uuid
+  planId         String       @map("plan_id") @db.Uuid
+  cycle          BillingCycle
+  amountMinor    BigInt       @map("amount_minor")
+  currency       String       @default("INR")
+  providerPlanId String?      @map("provider_plan_id")
+  active         Boolean      @default(true)
+  createdAt      DateTime     @default(now()) @map("created_at")
+
+  plan          SaasPlan             @relation(fields: [planId], references: [id])
+  subscriptions TenantSubscription[] @relation("SubscriptionPrice")
+
+  @@unique([planId, cycle])
+  @@map("saas_plan_price")
+  @@schema("platform")
+}
+
+/// The operator's own Razorpay account for SaaS billing. Readable only by gym_platform.
+model PlatformPaymentAccount {
+  id               String    @id @default(uuid()) @db.Uuid
+  /// RAZORPAY or FAKE (plain text: platform tables can't use app-schema enums).
+  provider         String
+  /// TEST or LIVE.
+  mode             String
+  keyId            String    @map("key_id")
+  keySecretEnc     String    @map("key_secret_enc")
+  webhookSecretEnc String    @map("webhook_secret_enc")
+  secretLast4      String    @map("secret_last4")
+  active           Boolean   @default(true)
+  lastVerifiedAt   DateTime? @map("last_verified_at")
+  updatedById      String?   @map("updated_by_id") @db.Uuid
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  @@map("platform_payment_account")
+  @@schema("platform")
+}
+
+model PlatformInvoice {
+  id                String                @id @default(uuid()) @db.Uuid
+  tenantId          String                @map("tenant_id") @db.Uuid
+  number            String                @unique
+  issueDate         DateTime              @map("issue_date") @db.Date
+  periodStart       DateTime?             @map("period_start")
+  periodEnd         DateTime?             @map("period_end")
+  description       String
+  /// Operator (supplier) and gym (recipient, B2B with GSTIN when registered) snapshots.
+  supplier          Json
+  recipient         Json
+  taxableMinor      BigInt                @map("taxable_minor")
+  cgstMinor         BigInt                @default(0) @map("cgst_minor")
+  sgstMinor         BigInt                @default(0) @map("sgst_minor")
+  igstMinor         BigInt                @default(0) @map("igst_minor")
+  totalMinor        BigInt                @map("total_minor")
+  currency          String                @default("INR")
+  status            PlatformInvoiceStatus @default(ISSUED)
+  providerPaymentId String?               @unique @map("provider_payment_id")
+  createdAt         DateTime              @default(now()) @map("created_at")
+
+  tenant   Tenant            @relation(fields: [tenantId], references: [id])
+  payments PlatformPayment[]
+
+  @@index([tenantId, issueDate])
+  @@map("platform_invoice")
+  @@schema("platform")
+}
+
+model PlatformPayment {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenantId          String   @map("tenant_id") @db.Uuid
+  invoiceId         String?  @map("invoice_id") @db.Uuid
+  providerPaymentId String   @unique @map("provider_payment_id")
+  amountMinor       BigInt   @map("amount_minor")
+  currency          String   @default("INR")
+  method            String?
+  capturedAt        DateTime @map("captured_at")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  tenant  Tenant           @relation(fields: [tenantId], references: [id])
+  invoice PlatformInvoice? @relation(fields: [invoiceId], references: [id])
+
+  @@index([tenantId, capturedAt])
+  @@map("platform_payment")
+  @@schema("platform")
+}
+
+model PlatformWebhookEvent {
+  id          String                @id @default(uuid()) @db.Uuid
+  eventId     String                @unique @map("event_id")
+  type        String
+  payload     Json
+  status      PlatformWebhookStatus @default(RECEIVED)
+  attempts    Int                   @default(0)
+  error       String?
+  receivedAt  DateTime              @default(now()) @map("received_at")
+  processedAt DateTime?             @map("processed_at")
+
+  @@index([status, receivedAt])
+  @@map("platform_webhook_event")
+  @@schema("platform")
+}
+
+/// Dunning and trial emails sent to owners; dedupe_key makes each one go out once.
+model DunningAttempt {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  stage     String
+  dedupeKey String   @unique @map("dedupe_key")
+  emails    String[] @default([])
+  sentAt    DateTime @default(now()) @map("sent_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, sentAt])
+  @@map("dunning_attempt")
+  @@schema("platform")
+}
+
+model Announcement {
+  id          String               @id @default(uuid()) @db.Uuid
+  title       String
+  body        String
+  audience    AnnouncementAudience @default(ALL)
+  planCodes   String[]             @default([]) @map("plan_codes")
+  statuses    SubscriptionStatus[] @default([])
+  startsAt    DateTime             @map("starts_at")
+  endsAt      DateTime?            @map("ends_at")
+  createdById String?              @map("created_by_id") @db.Uuid
+  archivedAt  DateTime?            @map("archived_at")
+  createdAt   DateTime             @default(now()) @map("created_at")
+
+  @@index([startsAt])
+  @@map("announcement")
+  @@schema("platform")
+}
+
+/// Gap-free counters for platform documents (SaaS invoice numbers), locked FOR UPDATE.
+model PlatformCounter {
+  key   String @id
+  value Int    @default(0)
+
+  @@map("platform_counter")
+  @@schema("platform")
+}
+
+// ===================================================================================
+// M5: CRM — leads, pipeline, follow-up tasks, trials, capture forms, API keys, campaigns,
+// domain events (outbox topic "event") and their idempotent consumers.
+// ===================================================================================
+
+/// Fixed meaning behind every custom stage, so funnel reports never break.
+enum LeadStageCategory {
+  NEW
+  CONTACTED
+  TRIAL_SCHEDULED
+  TRIAL_ATTENDED
+  OFFER_SENT
+  WON
+  LOST
+
+  @@schema("app")
+}
+
+enum LeadStatus {
+  OPEN
+  WON
+  LOST
+
+  @@schema("app")
+}
+
+enum LeadActivityType {
+  NOTE
+  CALL
+  EMAIL
+  MEETING
+  STAGE_CHANGE
+  ASSIGNMENT
+  TASK
+  TRIAL
+  CAPTURE
+  CONVERSION
+  SYSTEM
+
+  @@schema("app")
+}
+
+enum FollowUpTaskStatus {
+  OPEN
+  DONE
+  CANCELLED
+
+  @@schema("app")
+}
+
+enum FollowUpTaskKind {
+  FIRST_CONTACT
+  FOLLOW_UP
+  CALLBACK
+  TRIAL
+  OTHER
+
+  @@schema("app")
+}
+
+enum TrialStatus {
+  BOOKED
+  ATTENDED
+  NO_SHOW
+  CANCELLED
+
+  @@schema("app")
+}
+
+enum CampaignChannel {
+  FACEBOOK
+  INSTAGRAM
+  GOOGLE
+  WHATSAPP
+  SMS
+  EMAIL
+  WEBSITE
+  FLYER
+  REFERRAL
+  EVENT
+  OTHER
+
+  @@schema("app")
+}
+
+enum LeadAssignmentMode {
+  MANUAL
+  ROUND_ROBIN
+
+  @@schema("app")
+}
+
+model LeadStage {
+  id         String            @id @default(uuid()) @db.Uuid
+  tenantId   String            @map("tenant_id") @db.Uuid
+  name       String
+  category   LeadStageCategory
+  position   Int
+  archivedAt DateTime?         @map("archived_at")
+  createdAt  DateTime          @default(now()) @map("created_at")
+  updatedAt  DateTime          @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  leads  Lead[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, position])
+  @@map("lead_stage")
+  @@schema("app")
+}
+
+model LeadSource {
+  id         String    @id @default(uuid()) @db.Uuid
+  tenantId   String    @map("tenant_id") @db.Uuid
+  name       String
+  /// Stable key, e.g. "website", "walk_in"; matched against utm_source on capture.
+  code       String
+  /// Score points a lead from this source starts with (transparent scoring).
+  points     Int       @default(0)
+  archivedAt DateTime? @map("archived_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant            @relation(fields: [tenantId], references: [id])
+  leads  Lead[]
+  forms  LeadCaptureForm[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, code])
+  @@map("lead_source")
+  @@schema("app")
+}
+
+model LostReason {
+  id         String    @id @default(uuid()) @db.Uuid
+  tenantId   String    @map("tenant_id") @db.Uuid
+  name       String
+  position   Int       @default(0)
+  archivedAt DateTime? @map("archived_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  leads  Lead[]
+
+  @@unique([tenantId, id])
+  @@map("lost_reason")
+  @@schema("app")
+}
+
+model Campaign {
+  id          String          @id @default(uuid()) @db.Uuid
+  tenantId    String          @map("tenant_id") @db.Uuid
+  name        String
+  channel     CampaignChannel
+  /// Tracking code; matched (case-insensitive) against utm_campaign on capture.
+  code        String
+  startsOn    DateTime?       @map("starts_on") @db.Date
+  endsOn      DateTime?       @map("ends_on") @db.Date
+  budgetMinor BigInt?         @map("budget_minor")
+  archivedAt  DateTime?       @map("archived_at")
+  createdById String?         @map("created_by_id") @db.Uuid
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  tenant              Tenant              @relation(fields: [tenantId], references: [id])
+  leads               Lead[]
+  forms               LeadCaptureForm[]
+  // --- M6: sending to an audience (WhatsApp template)
+  segmentId           String?             @map("segment_id") @db.Uuid
+  templateId          String?             @map("template_id") @db.Uuid
+  /// Template placeholder → field (validated), e.g. {"1": "member.firstName"}.
+  variableMap         Json?               @map("variable_map")
+  sendStatus          CampaignSendStatus  @default(NONE) @map("send_status")
+  scheduledAt         DateTime?           @map("scheduled_at")
+  launchedAt          DateTime?           @map("launched_at")
+  completedAt         DateTime?           @map("completed_at")
+  cancelledAt         DateTime?           @map("cancelled_at")
+  launchedById        String?             @map("launched_by_id") @db.Uuid
+  throttlePerMinute   Int                 @default(60) @map("throttle_per_minute")
+  /// Renewals/payments/conversions by recipients within this many days are attributed.
+  attributionDays     Int                 @default(14) @map("attribution_days")
+  estimatedRecipients Int?                @map("estimated_recipients")
+  segment             Segment?            @relation(fields: [tenantId, segmentId], references: [tenantId, id])
+  recipients          CampaignRecipient[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, code])
+  @@map("campaign")
+  @@schema("app")
+}
+
+model Lead {
+  id                    String     @id @default(uuid()) @db.Uuid
+  tenantId              String     @map("tenant_id") @db.Uuid
+  branchId              String     @map("branch_id") @db.Uuid
+  firstName             String     @map("first_name")
+  lastName              String?    @map("last_name")
+  /// E.164 (normalizePhone), used for duplicate checks.
+  phone                 String?
+  /// Lower-cased.
+  email                 String?
+  /// What they asked about: plan, goal, preferred time.
+  interest              String?
+  sourceId              String?    @map("source_id") @db.Uuid
+  campaignId            String?    @map("campaign_id") @db.Uuid
+  utmSource             String?    @map("utm_source")
+  utmMedium             String?    @map("utm_medium")
+  utmCampaign           String?    @map("utm_campaign")
+  utmTerm               String?    @map("utm_term")
+  utmContent            String?    @map("utm_content")
+  referrer              String?
+  /// {sourceId, campaignId, utm..., at, via}: the first and the latest enquiry.
+  firstTouch            Json?      @map("first_touch")
+  lastTouch             Json?      @map("last_touch")
+  stageId               String     @map("stage_id") @db.Uuid
+  ownerUserId           String?    @map("owner_user_id") @db.Uuid
+  status                LeadStatus @default(OPEN)
+  score                 Int        @default(0)
+  lostReasonId          String?    @map("lost_reason_id") @db.Uuid
+  lostNote              String?    @map("lost_note")
+  convertedMemberId     String?    @map("converted_member_id") @db.Uuid
+  convertedMembershipId String?    @map("converted_membership_id") @db.Uuid
+  captureFormId         String?    @map("capture_form_id") @db.Uuid
+  /// Consent as given on the form or to staff: the exact text shown, and when.
+  consentText           String?    @map("consent_text")
+  consentAt             DateTime?  @map("consent_at")
+  marketingConsent      Boolean    @default(false) @map("marketing_consent")
+  firstContactedAt      DateTime?  @map("first_contacted_at")
+  lastContactedAt       DateTime?  @map("last_contacted_at")
+  /// Set once when the first-contact SLA was missed (the event fires once).
+  slaBreachedAt         DateTime?  @map("sla_breached_at")
+  wonAt                 DateTime?  @map("won_at")
+  lostAt                DateTime?  @map("lost_at")
+  createdById           String?    @map("created_by_id") @db.Uuid
+  createdAt             DateTime   @default(now()) @map("created_at")
+  updatedAt             DateTime   @updatedAt @map("updated_at")
+
+  tenant              Tenant           @relation(fields: [tenantId], references: [id])
+  branch              Branch           @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  stage               LeadStage        @relation(fields: [tenantId, stageId], references: [tenantId, id])
+  source              LeadSource?      @relation(fields: [tenantId, sourceId], references: [tenantId, id])
+  campaign            Campaign?        @relation(fields: [tenantId, campaignId], references: [tenantId, id])
+  lostReason          LostReason?      @relation(fields: [tenantId, lostReasonId], references: [tenantId, id])
+  convertedMember     MemberProfile?   @relation("LeadConvertedMember", fields: [tenantId, convertedMemberId], references: [tenantId, id])
+  convertedMembership Membership?      @relation("LeadConvertedMembership", fields: [tenantId, convertedMembershipId], references: [tenantId, id])
+  captureForm         LeadCaptureForm? @relation(fields: [tenantId, captureFormId], references: [tenantId, id])
+  activities          LeadActivity[]
+  tasks               FollowUpTask[]
+  trials              TrialBooking[]
+  memberships         Membership[]     @relation("MembershipLead")
+  conversations       Conversation[]
+  consents            ContactConsent[]
+  referral            Referral?
+
+  @@unique([tenantId, id])
+  @@index([tenantId, status, stageId])
+  @@index([tenantId, branchId, createdAt])
+  @@index([tenantId, ownerUserId, status])
+  @@index([tenantId, phone])
+  @@index([tenantId, email])
+  @@index([tenantId, campaignId])
+  @@map("lead")
+  @@schema("app")
+}
+
+/// The lead's timeline. Append-only for the app role.
+model LeadActivity {
+  id        String           @id @default(uuid()) @db.Uuid
+  tenantId  String           @map("tenant_id") @db.Uuid
+  leadId    String           @map("lead_id") @db.Uuid
+  type      LeadActivityType
+  body      String?
+  /// e.g. {from, to} for stage changes, {outcome, minutes} for calls.
+  meta      Json?
+  userId    String?          @map("user_id") @db.Uuid
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  lead Lead @relation(fields: [tenantId, leadId], references: [tenantId, id])
+
+  @@index([tenantId, leadId, createdAt])
+  @@map("lead_activity")
+  @@schema("app")
+}
+
+model FollowUpTask {
+  id             String             @id @default(uuid()) @db.Uuid
+  tenantId       String             @map("tenant_id") @db.Uuid
+  branchId       String             @map("branch_id") @db.Uuid
+  kind           FollowUpTaskKind   @default(FOLLOW_UP)
+  title          String
+  notes          String?
+  dueAt          DateTime           @map("due_at")
+  assigneeUserId String?            @map("assignee_user_id") @db.Uuid
+  status         FollowUpTaskStatus @default(OPEN)
+  leadId         String?            @map("lead_id") @db.Uuid
+  memberId       String?            @map("member_id") @db.Uuid
+  outcome        String?
+  remindedAt     DateTime?          @map("reminded_at")
+  completedAt    DateTime?          @map("completed_at")
+  completedById  String?            @map("completed_by_id") @db.Uuid
+  createdById    String?            @map("created_by_id") @db.Uuid
+  createdAt      DateTime           @default(now()) @map("created_at")
+  updatedAt      DateTime           @updatedAt @map("updated_at")
+
+  branch Branch         @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  lead   Lead?          @relation(fields: [tenantId, leadId], references: [tenantId, id])
+  member MemberProfile? @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, assigneeUserId, status, dueAt])
+  @@index([tenantId, status, dueAt])
+  @@index([tenantId, leadId])
+  @@map("follow_up_task")
+  @@schema("app")
+}
+
+model TrialBooking {
+  id             String      @id @default(uuid()) @db.Uuid
+  tenantId       String      @map("tenant_id") @db.Uuid
+  branchId       String      @map("branch_id") @db.Uuid
+  leadId         String      @map("lead_id") @db.Uuid
+  /// Into a class (takes a seat) or a free slot (startsAt/endsAt only).
+  classSessionId String?     @map("class_session_id") @db.Uuid
+  startsAt       DateTime    @map("starts_at")
+  endsAt         DateTime    @map("ends_at")
+  trainerUserId  String?     @map("trainer_user_id") @db.Uuid
+  status         TrialStatus @default(BOOKED)
+  /// Temporary trial pass: random, no PII; the QR shows `GT1.<passCode>`. Valid on the trial day only.
+  passCode       String      @unique @map("pass_code")
+  notes          String?
+  attendedAt     DateTime?   @map("attended_at")
+  attendedVia    String?     @map("attended_via")
+  cancelledAt    DateTime?   @map("cancelled_at")
+  reminderSentAt DateTime?   @map("reminder_sent_at")
+  createdById    String?     @map("created_by_id") @db.Uuid
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+
+  branch       Branch        @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  lead         Lead          @relation(fields: [tenantId, leadId], references: [tenantId, id])
+  classSession ClassSession? @relation(fields: [tenantId, classSessionId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, branchId, startsAt])
+  @@index([tenantId, leadId])
+  @@index([tenantId, classSessionId])
+  @@index([tenantId, attendedAt])
+  @@map("trial_booking")
+  @@schema("app")
+}
+
+model LeadCaptureForm {
+  id            String    @id @default(uuid()) @db.Uuid
+  tenantId      String    @map("tenant_id") @db.Uuid
+  branchId      String    @map("branch_id") @db.Uuid
+  /// Public key in /l/{tenantSlug}/{key}: random, unguessable, unique across tenants.
+  key           String    @unique
+  name          String
+  title         String
+  intro         String?
+  /// Optional fields shown: "email", "interest", "preferredTime", "message".
+  fields        String[]  @default(["email", "interest"])
+  /// Required consent checkbox text, stored with each lead.
+  consentText   String    @map("consent_text")
+  /// Optional second checkbox for offers (marketing).
+  marketingText String?   @map("marketing_text")
+  thankYou      String    @map("thank_you")
+  sourceId      String?   @map("source_id") @db.Uuid
+  campaignId    String?   @map("campaign_id") @db.Uuid
+  /// Sites allowed to embed the form (frame-ancestors); empty = this app only.
+  embedOrigins  String[]  @default([]) @map("embed_origins")
+  archivedAt    DateTime? @map("archived_at")
+  createdById   String?   @map("created_by_id") @db.Uuid
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  tenant   Tenant      @relation(fields: [tenantId], references: [id])
+  branch   Branch      @relation(fields: [tenantId, branchId], references: [tenantId, id])
+  source   LeadSource? @relation(fields: [tenantId, sourceId], references: [tenantId, id])
+  campaign Campaign?   @relation(fields: [tenantId, campaignId], references: [tenantId, id])
+  leads    Lead[]
+
+  @@unique([tenantId, id])
+  @@map("lead_capture_form")
+  @@schema("app")
+}
+
+/// Integration keys for the public API. Only a SHA-256 of the secret is stored.
+model TenantApiKey {
+  id          String    @id @default(uuid()) @db.Uuid
+  tenantId    String    @map("tenant_id") @db.Uuid
+  name        String
+  /// Public part of the key (`gk_<prefix>_<secret>`), unique across tenants; used for lookup.
+  prefix      String    @unique
+  secretHash  String    @map("secret_hash")
+  scopes      String[]
+  /// Leads created with this key go to this branch.
+  branchId    String    @map("branch_id") @db.Uuid
+  lastUsedAt  DateTime? @map("last_used_at")
+  revokedAt   DateTime? @map("revoked_at")
+  revokedById String?   @map("revoked_by_id") @db.Uuid
+  createdById String?   @map("created_by_id") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  branch Branch @relation(fields: [tenantId, branchId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@map("tenant_api_key")
+  @@schema("app")
+}
+
+model LeadSavedView {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  name      String
+  /// The list filters (validated on use).
+  filters   Json
+  /// Visible to everyone in the gym who can see leads.
+  shared    Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, userId])
+  @@map("lead_saved_view")
+  @@schema("app")
+}
+
+/// Round-robin pointer per branch: the last person given a lead.
+model LeadAssignmentCursor {
+  tenantId   String   @map("tenant_id") @db.Uuid
+  branchId   String   @map("branch_id") @db.Uuid
+  lastUserId String?  @map("last_user_id") @db.Uuid
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [tenantId, branchId], references: [tenantId, id])
+
+  @@id([tenantId, branchId])
+  @@map("lead_assignment_cursor")
+  @@schema("app")
+}
+
+/// Idempotent event consumers: one row per (event, handler) that has run.
+model EventConsumption {
+  tenantId  String   @map("tenant_id") @db.Uuid
+  eventId   String   @map("event_id") @db.Uuid
+  handler   String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@id([tenantId, eventId, handler])
+  @@map("event_consumption")
+  @@schema("app")
+}
+
+// ===================================================================================
+// M6: WhatsApp (tenant-owned WABAs, D-12), templates, suppression, messages, segments,
+// campaign sending, automation engine, retention flags and recovery outcomes.
+// ===================================================================================
+
+enum WhatsAppConnectionMethod {
+  MANUAL
+  EMBEDDED_SIGNUP
+  FAKE
+
+  @@schema("app")
+}
+
+enum WhatsAppAccountStatus {
+  ACTIVE
+  ERROR
+  DISCONNECTED
+
+  @@schema("app")
+}
+
+enum TemplateCategory {
+  MARKETING
+  UTILITY
+  AUTHENTICATION
+  OTHER
+
+  @@schema("app")
+}
+
+enum SuppressionReason {
+  OPT_OUT
+  BLOCKED
+  BOUNCED
+  MANUAL
+
+  @@schema("app")
+}
+
+enum MessageKind {
+  TEMPLATE
+  TEXT
+
+  @@schema("app")
+}
+
+enum MessagePurpose {
+  CAMPAIGN
+  AUTOMATION
+  NOTIFICATION
+  INBOX
+  TEST
+
+  @@schema("app")
+}
+
+enum OutboundStatus {
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  SKIPPED
+
+  @@schema("app")
+}
+
+enum MessageEventKind {
+  STATUS
+  INBOUND
+  TEMPLATE_STATUS
+
+  @@schema("app")
+}
+
+enum MessageEventStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+
+  @@schema("app")
+}
+
+enum SegmentEntity {
+  MEMBER
+  LEAD
+
+  @@schema("app")
+}
+
+enum CampaignSendStatus {
+  NONE
+  DRAFT
+  SCHEDULED
+  SENDING
+  SENT
+  CANCELLED
+
+  @@schema("app")
+}
+
+enum CampaignRecipientStatus {
+  PENDING
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  SKIPPED
+
+  @@schema("app")
+}
+
+enum AutomationExecutionStatus {
+  RUNNING
+  WAITING
+  AWAITING_APPROVAL
+  COMPLETED
+  EXITED
+  FAILED
+  CANCELLED
+
+  @@schema("app")
+}
+
+enum AutomationStepStatus {
+  DONE
+  SKIPPED
+  FAILED
+  WAITING
+
+  @@schema("app")
+}
+
+enum RetentionRuleKind {
+  NO_VISIT
+  VISIT_DROP
+  EXPIRING
+  OVERDUE
+  UNUSED_CREDITS
+  TRIAL_FOLLOW_UP
+
+  @@schema("app")
+}
+
+enum RetentionFlagStatus {
+  OPEN
+  ACTIONED
+  RESOLVED
+  DISMISSED
+
+  @@schema("app")
+}
+
+enum RecoveryKind {
+  RENEWED
+  PAID
+  REACTIVATED
+  CONVERTED
+
+  @@schema("app")
+}
+
+/// A gym's own WhatsApp Business Account + phone number (D-12). The token is envelope-encrypted.
+model WhatsAppAccount {
+  id                String                   @id @default(uuid()) @db.Uuid
+  tenantId          String                   @map("tenant_id") @db.Uuid
+  wabaId            String                   @map("waba_id")
+  phoneNumberId     String                   @map("phone_number_id")
+  displayPhone      String?                  @map("display_phone")
+  verifiedName      String?                  @map("verified_name")
+  accessTokenEnc    String                   @map("access_token_enc")
+  tokenLast4        String                   @map("token_last4")
+  connectionMethod  WhatsAppConnectionMethod @map("connection_method")
+  status            WhatsAppAccountStatus    @default(ACTIVE)
+  qualityRating     String?                  @map("quality_rating")
+  messagingLimit    String?                  @map("messaging_limit")
+  webhookSubscribed Boolean                  @default(false) @map("webhook_subscribed")
+  lastSyncedAt      DateTime?                @map("last_synced_at")
+  lastError         String?                  @map("last_error")
+  connectedById     String?                  @map("connected_by_id") @db.Uuid
+  disconnectedAt    DateTime?                @map("disconnected_at")
+  createdAt         DateTime                 @default(now()) @map("created_at")
+  updatedAt         DateTime                 @updatedAt @map("updated_at")
+
+  tenant        Tenant            @relation(fields: [tenantId], references: [id])
+  templates     MessageTemplate[]
+  conversations Conversation[]
+  outbound      OutboundMessage[]
+  events        MessageEvent[]
+
+  @@unique([tenantId, id])
+  @@index([phoneNumberId])
+  @@index([wabaId])
+  @@map("whatsapp_account")
+  @@schema("app")
+}
+
+/// Templates synced from Meta (read-only copies; edited in Meta's manager).
+model MessageTemplate {
+  id                 String           @id @default(uuid()) @db.Uuid
+  tenantId           String           @map("tenant_id") @db.Uuid
+  accountId          String           @map("account_id") @db.Uuid
+  providerTemplateId String?          @map("provider_template_id")
+  name               String
+  language           String
+  category           TemplateCategory
+  /// Meta's status: APPROVED, PENDING, REJECTED, PAUSED, DISABLED, …
+  status             String
+  parameterFormat    String           @default("POSITIONAL") @map("parameter_format")
+  /// Placeholder names in body order: ["1","2"] or ["first_name", …].
+  variables          String[]         @default([])
+  bodyText           String?          @map("body_text")
+  components         Json
+  syncedAt           DateTime         @map("synced_at")
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+
+  account  WhatsAppAccount   @relation(fields: [tenantId, accountId], references: [tenantId, id])
+  outbound OutboundMessage[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, accountId, name, language])
+  @@map("message_template")
+  @@schema("app")
+}
+
+/// Never contact this address on this channel (opt-out keyword, block, bounce, staff). Applies to
+/// every future send, checked at send time.
+model SuppressionRecord {
+  id          String            @id @default(uuid()) @db.Uuid
+  tenantId    String            @map("tenant_id") @db.Uuid
+  channel     ConsentChannel
+  /// E.164 phone or lower-case email.
+  address     String
+  reason      SuppressionReason
+  note        String?
+  createdById String?           @map("created_by_id") @db.Uuid
+  createdAt   DateTime          @default(now()) @map("created_at")
+  liftedAt    DateTime?         @map("lifted_at")
+  liftedById  String?           @map("lifted_by_id") @db.Uuid
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, channel, address])
+  @@map("suppression_record")
+  @@schema("app")
+}
+
+/// One WhatsApp thread per phone number per account (minimal inbox).
+model Conversation {
+  id             String    @id @default(uuid()) @db.Uuid
+  tenantId       String    @map("tenant_id") @db.Uuid
+  accountId      String    @map("account_id") @db.Uuid
+  phone          String
+  profileName    String?   @map("profile_name")
+  memberId       String?   @map("member_id") @db.Uuid
+  leadId         String?   @map("lead_id") @db.Uuid
+  assigneeUserId String?   @map("assignee_user_id") @db.Uuid
+  /// The 24-hour customer service window runs from the last inbound message.
+  lastInboundAt  DateTime? @map("last_inbound_at")
+  lastMessageAt  DateTime? @map("last_message_at")
+  unread         Int       @default(0)
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  account  WhatsAppAccount   @relation(fields: [tenantId, accountId], references: [tenantId, id])
+  member   MemberProfile?    @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  lead     Lead?             @relation(fields: [tenantId, leadId], references: [tenantId, id])
+  inbound  InboundMessage[]
+  outbound OutboundMessage[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, accountId, phone])
+  @@index([tenantId, lastMessageAt])
+  @@map("conversation")
+  @@schema("app")
+}
+
+model InboundMessage {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenantId          String   @map("tenant_id") @db.Uuid
+  conversationId    String   @map("conversation_id") @db.Uuid
+  providerMessageId String   @map("provider_message_id")
+  type              String
+  text              String?
+  receivedAt        DateTime @map("received_at")
+  /// Opt-out / opt-in keyword it matched, if any.
+  keyword           String?
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  conversation Conversation @relation(fields: [tenantId, conversationId], references: [tenantId, id])
+
+  @@unique([tenantId, providerMessageId])
+  @@index([tenantId, conversationId, receivedAt])
+  @@map("inbound_message")
+  @@schema("app")
+}
+
+/// Every WhatsApp send (campaign, automation, notification, inbox reply, test). Idempotent per key.
+model OutboundMessage {
+  id                String           @id @default(uuid()) @db.Uuid
+  tenantId          String           @map("tenant_id") @db.Uuid
+  accountId         String           @map("account_id") @db.Uuid
+  conversationId    String?          @map("conversation_id") @db.Uuid
+  /// e.g. "campaign:<recipientId>", "auto:<executionId>:<step>", "notif:<dedupeKey>".
+  idempotencyKey    String           @map("idempotency_key")
+  toPhone           String           @map("to_phone")
+  memberId          String?          @map("member_id") @db.Uuid
+  leadId            String?          @map("lead_id") @db.Uuid
+  kind              MessageKind
+  templateId        String?          @map("template_id") @db.Uuid
+  templateName      String?          @map("template_name")
+  language          String?
+  /// Values for the template placeholders, in order or by name.
+  variables         Json?
+  /// Rendered preview (template body with values, or the free text).
+  body              String?
+  category          TemplateCategory
+  purpose           MessagePurpose
+  status            OutboundStatus   @default(QUEUED)
+  skipReason        String?          @map("skip_reason")
+  providerMessageId String?          @map("provider_message_id")
+  errorCode         String?          @map("error_code")
+  errorMessage      String?          @map("error_message")
+  attempts          Int              @default(0)
+  pricingCategory   String?          @map("pricing_category")
+  campaignId        String?          @map("campaign_id") @db.Uuid
+  executionId       String?          @map("execution_id") @db.Uuid
+  createdById       String?          @map("created_by_id") @db.Uuid
+  queuedAt          DateTime         @default(now()) @map("queued_at")
+  sentAt            DateTime?        @map("sent_at")
+  deliveredAt       DateTime?        @map("delivered_at")
+  readAt            DateTime?        @map("read_at")
+  failedAt          DateTime?        @map("failed_at")
+  updatedAt         DateTime         @updatedAt @map("updated_at")
+
+  account      WhatsAppAccount     @relation(fields: [tenantId, accountId], references: [tenantId, id])
+  conversation Conversation?       @relation(fields: [tenantId, conversationId], references: [tenantId, id])
+  template     MessageTemplate?    @relation(fields: [tenantId, templateId], references: [tenantId, id])
+  recipients   CampaignRecipient[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, idempotencyKey])
+  @@unique([tenantId, providerMessageId])
+  @@index([tenantId, status, queuedAt])
+  @@index([tenantId, memberId, queuedAt])
+  @@index([tenantId, campaignId])
+  @@map("outbound_message")
+  @@schema("app")
+}
+
+/// Verified Meta webhook items for this tenant, stored once (dedupe key), processed by the worker.
+model MessageEvent {
+  id          String             @id @default(uuid()) @db.Uuid
+  tenantId    String             @map("tenant_id") @db.Uuid
+  accountId   String             @map("account_id") @db.Uuid
+  kind        MessageEventKind
+  /// "status:<wamid>:<status>", "inbound:<wamid>", "template:<id>:<status>:<ts>".
+  dedupeKey   String             @map("dedupe_key")
+  payload     Json
+  status      MessageEventStatus @default(RECEIVED)
+  attempts    Int                @default(0)
+  error       String?
+  receivedAt  DateTime           @default(now()) @map("received_at")
+  processedAt DateTime?          @map("processed_at")
+
+  account WhatsAppAccount @relation(fields: [tenantId, accountId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, dedupeKey])
+  @@index([tenantId, status, receivedAt])
+  @@map("message_event")
+  @@schema("app")
+}
+
+/// A saved audience: validated filter DSL over whitelisted fields (never SQL).
+model Segment {
+  id          String        @id @default(uuid()) @db.Uuid
+  tenantId    String        @map("tenant_id") @db.Uuid
+  name        String
+  entity      SegmentEntity
+  definition  Json
+  createdById String?       @map("created_by_id") @db.Uuid
+  archivedAt  DateTime?     @map("archived_at")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  campaigns Campaign[]
+
+  @@unique([tenantId, id])
+  @@map("segment")
+  @@schema("app")
+}
+
+model CampaignRecipient {
+  id                String                  @id @default(uuid()) @db.Uuid
+  tenantId          String                  @map("tenant_id") @db.Uuid
+  campaignId        String                  @map("campaign_id") @db.Uuid
+  memberId          String?                 @map("member_id") @db.Uuid
+  leadId            String?                 @map("lead_id") @db.Uuid
+  phone             String
+  name              String?
+  status            CampaignRecipientStatus @default(PENDING)
+  skipReason        String?                 @map("skip_reason")
+  variables         Json?
+  outboundMessageId String?                 @map("outbound_message_id") @db.Uuid
+  createdAt         DateTime                @default(now()) @map("created_at")
+  updatedAt         DateTime                @updatedAt @map("updated_at")
+
+  campaign        Campaign         @relation(fields: [tenantId, campaignId], references: [tenantId, id])
+  outboundMessage OutboundMessage? @relation(fields: [tenantId, outboundMessageId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, campaignId, phone])
+  @@index([tenantId, campaignId, status])
+  @@map("campaign_recipient")
+  @@schema("app")
+}
+
+model AutomationWorkflow {
+  id               String    @id @default(uuid()) @db.Uuid
+  tenantId         String    @map("tenant_id") @db.Uuid
+  /// Ready-made template it was installed from, if any.
+  templateKey      String?   @map("template_key")
+  name             String
+  enabled          Boolean   @default(false)
+  currentVersionId String?   @map("current_version_id") @db.Uuid
+  createdById      String?   @map("created_by_id") @db.Uuid
+  archivedAt       DateTime? @map("archived_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  tenant     Tenant                      @relation(fields: [tenantId], references: [id])
+  versions   AutomationWorkflowVersion[]
+  executions AutomationExecution[]
+
+  @@unique([tenantId, id])
+  @@map("automation_workflow")
+  @@schema("app")
+}
+
+/// Immutable: editing a workflow creates the next version; executions point at the version they ran.
+model AutomationWorkflowVersion {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  workflowId  String   @map("workflow_id") @db.Uuid
+  version     Int
+  definition  Json
+  createdById String?  @map("created_by_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  workflow   AutomationWorkflow    @relation(fields: [tenantId, workflowId], references: [tenantId, id])
+  executions AutomationExecution[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, workflowId, version])
+  @@map("automation_workflow_version")
+  @@schema("app")
+}
+
+model AutomationExecution {
+  id          String                    @id @default(uuid()) @db.Uuid
+  tenantId    String                    @map("tenant_id") @db.Uuid
+  workflowId  String                    @map("workflow_id") @db.Uuid
+  versionId   String                    @map("version_id") @db.Uuid
+  /// Event id, or a scan key like "expiring:<membershipId>:7". Unique per version: never twice.
+  triggerKey  String                    @map("trigger_key")
+  triggerType String                    @map("trigger_type")
+  memberId    String?                   @map("member_id") @db.Uuid
+  leadId      String?                   @map("lead_id") @db.Uuid
+  /// Facts from the trigger (ids, dates) the steps may use.
+  context     Json
+  status      AutomationExecutionStatus @default(RUNNING)
+  nextStep    Int                       @default(0) @map("next_step")
+  resumeAt    DateTime?                 @map("resume_at")
+  error       String?
+  startedAt   DateTime                  @default(now()) @map("started_at")
+  finishedAt  DateTime?                 @map("finished_at")
+
+  workflow AutomationWorkflow        @relation(fields: [tenantId, workflowId], references: [tenantId, id])
+  version  AutomationWorkflowVersion @relation(fields: [tenantId, versionId], references: [tenantId, id])
+  steps    AutomationStepRun[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, versionId, triggerKey])
+  @@index([tenantId, status, resumeAt])
+  @@index([tenantId, workflowId, startedAt])
+  @@map("automation_execution")
+  @@schema("app")
+}
+
+model AutomationStepRun {
+  id           String               @id @default(uuid()) @db.Uuid
+  tenantId     String               @map("tenant_id") @db.Uuid
+  executionId  String               @map("execution_id") @db.Uuid
+  stepIndex    Int                  @map("step_index")
+  type         String
+  status       AutomationStepStatus
+  result       Json?
+  attempts     Int                  @default(1)
+  approvedById String?              @map("approved_by_id") @db.Uuid
+  approvedAt   DateTime?            @map("approved_at")
+  startedAt    DateTime             @default(now()) @map("started_at")
+  finishedAt   DateTime?            @map("finished_at")
+
+  execution AutomationExecution @relation(fields: [tenantId, executionId], references: [tenantId, id])
+
+  @@unique([tenantId, executionId, stepIndex])
+  @@map("automation_step_run")
+  @@schema("app")
+}
+
+/// A gym's thresholds for each retention signal.
+model RetentionRule {
+  id        String            @id @default(uuid()) @db.Uuid
+  tenantId  String            @map("tenant_id") @db.Uuid
+  kind      RetentionRuleKind
+  enabled   Boolean           @default(true)
+  /// Days, percent or count depending on the kind.
+  threshold Int
+  updatedAt DateTime          @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, kind])
+  @@map("retention_rule")
+  @@schema("app")
+}
+
+/// "This member/lead needs attention because <rule>". One open flag per subject per rule.
+model RetentionFlag {
+  id           String              @id @default(uuid()) @db.Uuid
+  tenantId     String              @map("tenant_id") @db.Uuid
+  branchId     String?             @map("branch_id") @db.Uuid
+  memberId     String?             @map("member_id") @db.Uuid
+  leadId       String?             @map("lead_id") @db.Uuid
+  kind         RetentionRuleKind
+  /// Plain-language reason, e.g. "No visit for 16 days (rule: 14)".
+  reason       String
+  details      Json?
+  status       RetentionFlagStatus @default(OPEN)
+  action       String?
+  actionedAt   DateTime?           @map("actioned_at")
+  actionedById String?             @map("actioned_by_id") @db.Uuid
+  resolvedAt   DateTime?           @map("resolved_at")
+  outcome      String?
+  createdAt    DateTime            @default(now()) @map("created_at")
+  updatedAt    DateTime            @updatedAt @map("updated_at")
+
+  tenant   Tenant            @relation(fields: [tenantId], references: [id])
+  outcomes RecoveryOutcome[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, status, kind])
+  @@map("retention_flag")
+  @@schema("app")
+}
+
+/// Something good that happened after we flagged, reminded or messaged (associated, not causal).
+model RecoveryOutcome {
+  id          String       @id @default(uuid()) @db.Uuid
+  tenantId    String       @map("tenant_id") @db.Uuid
+  kind        RecoveryKind
+  memberId    String?      @map("member_id") @db.Uuid
+  leadId      String?      @map("lead_id") @db.Uuid
+  flagId      String?      @map("flag_id") @db.Uuid
+  campaignId  String?      @map("campaign_id") @db.Uuid
+  executionId String?      @map("execution_id") @db.Uuid
+  /// What happened: the membership, payment, check-in or lead id.
+  refId       String       @map("ref_id")
+  amountMinor BigInt?      @map("amount_minor")
+  occurredAt  DateTime     @map("occurred_at")
+  createdAt   DateTime     @default(now()) @map("created_at")
+
+  flag RetentionFlag? @relation(fields: [tenantId, flagId], references: [tenantId, id])
+
+  @@unique([tenantId, kind, refId])
+  @@index([tenantId, occurredAt])
+  @@map("recovery_outcome")
+  @@schema("app")
+}
+
+// ===================================================================================
+// M7: fitness programs, nutrition, progress and engagement. Health and fitness data is
+// sensitive: stored only after a health-data consent, readable by the member, their assigned
+// trainer and Owner/Admin (fitness.view_all), never through members.view.
+// ===================================================================================
+
+enum ExerciseMeasure {
+  REPS
+  TIME
+  DISTANCE
+
+  @@schema("app")
+}
+
+enum FitnessLevel {
+  BEGINNER
+  INTERMEDIATE
+  ADVANCED
+
+  @@schema("app")
+}
+
+enum WorkoutPlanStatus {
+  ACTIVE
+  COMPLETED
+  ENDED
+
+  @@schema("app")
+}
+
+enum WorkoutLogStatus {
+  IN_PROGRESS
+  COMPLETED
+
+  @@schema("app")
+}
+
+enum PersonalRecordKind {
+  MAX_WEIGHT
+  EST_1RM
+  MAX_REPS
+  MAX_DURATION
+  MAX_DISTANCE
+
+  @@schema("app")
+}
+
+enum GoalType {
+  WEIGHT
+  BODY_FAT
+  MEASUREMENT
+  STRENGTH
+  ATTENDANCE
+  CUSTOM
+
+  @@schema("app")
+}
+
+enum GoalStatus {
+  ACTIVE
+  ACHIEVED
+  ABANDONED
+
+  @@schema("app")
+}
+
+enum MealSlot {
+  BREAKFAST
+  MORNING_SNACK
+  LUNCH
+  EVENING_SNACK
+  DINNER
+  OTHER
+
+  @@schema("app")
+}
+
+enum FoodLogSource {
+  LIBRARY
+  CUSTOM
+  PLAN
+
+  @@schema("app")
+}
+
+enum NutritionPlanStatus {
+  ACTIVE
+  ENDED
+
+  @@schema("app")
+}
+
+enum FeedbackTarget {
+  WORKOUT_LOG
+  ASSESSMENT
+  NUTRITION
+  GENERAL
+
+  @@schema("app")
+}
+
+enum MemberAudience {
+  ALL
+  BRANCH
+  PLAN
+
+  @@schema("app")
+}
+
+enum StreakStatus {
+  ACTIVE
+  FROZEN
+  BROKEN
+
+  @@schema("app")
+}
+
+enum AchievementKind {
+  VISITS
+  WORKOUTS
+  PERSONAL_RECORDS
+  STREAK_WEEKS
+  CHALLENGES
+
+  @@schema("app")
+}
+
+enum ChallengeMetric {
+  VISITS
+  WORKOUTS
+
+  @@schema("app")
+}
+
+enum ChallengeStatus {
+  DRAFT
+  ACTIVE
+  ENDED
+  CANCELLED
+
+  @@schema("app")
+}
+
+enum RewardTrigger {
+  VISIT
+  WORKOUT_COMPLETED
+  REFERRAL_CONVERTED
+  CHALLENGE_COMPLETED
+  ACHIEVEMENT
+
+  @@schema("app")
+}
+
+enum RewardEntryKind {
+  EARN
+  REDEEM
+  REVERSE
+  ADJUST
+
+  @@schema("app")
+}
+
+enum RedemptionKind {
+  CREDIT
+  PERK
+
+  @@schema("app")
+}
+
+enum RedemptionStatus {
+  REQUESTED
+  FULFILLED
+  REJECTED
+
+  @@schema("app")
+}
+
+enum ReferralStatus {
+  PENDING
+  JOINED
+  REWARDED
+  REJECTED
+
+  @@schema("app")
+}
+
+/// The member's health-data consent history (append-only; the latest row decides).
+model HealthDataConsent {
+  id               String        @id @default(uuid()) @db.Uuid
+  tenantId         String        @map("tenant_id") @db.Uuid
+  memberId         String        @map("member_id") @db.Uuid
+  status           ConsentStatus
+  /// Version of the consent text shown.
+  version          String
+  evidence         String
+  method           ConsentMethod
+  capturedByUserId String?       @map("captured_by_user_id") @db.Uuid
+  capturedAt       DateTime      @default(now()) @map("captured_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@index([tenantId, memberId, capturedAt])
+  @@map("health_data_consent")
+  @@schema("app")
+}
+
+/// A gym's exercise library: a copy of the built-in library (libraryKey) plus its own exercises.
+model Exercise {
+  id            String          @id @default(uuid()) @db.Uuid
+  tenantId      String          @map("tenant_id") @db.Uuid
+  libraryKey    String?         @map("library_key")
+  name          String
+  primaryMuscle String          @map("primary_muscle")
+  muscleGroups  String[]        @default([]) @map("muscle_groups")
+  equipment     String
+  measure       ExerciseMeasure @default(REPS)
+  level         FitnessLevel    @default(BEGINNER)
+  instructions  String
+  mediaUrl      String?         @map("media_url")
+  mediaFileId   String?         @map("media_file_id") @db.Uuid
+  custom        Boolean         @default(false)
+  createdById   String?         @map("created_by_id") @db.Uuid
+  archivedAt    DateTime?       @map("archived_at")
+  createdAt     DateTime        @default(now()) @map("created_at")
+  updatedAt     DateTime        @updatedAt @map("updated_at")
+
+  tenant  Tenant           @relation(fields: [tenantId], references: [id])
+  sets    SetLog[]
+  records PersonalRecord[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, libraryKey])
+  @@index([tenantId, primaryMuscle])
+  @@map("exercise")
+  @@schema("app")
+}
+
+/// A reusable program. structure = { weeks: [{ days: [{ title, items: [...] }] }] } (validated).
+model WorkoutTemplate {
+  id          String       @id @default(uuid()) @db.Uuid
+  tenantId    String       @map("tenant_id") @db.Uuid
+  name        String
+  description String?
+  level       FitnessLevel @default(BEGINNER)
+  structure   Json
+  createdById String?      @map("created_by_id") @db.Uuid
+  archivedAt  DateTime?    @map("archived_at")
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+
+  tenant Tenant        @relation(fields: [tenantId], references: [id])
+  plans  WorkoutPlan[]
+
+  @@unique([tenantId, id])
+  @@map("workout_template")
+  @@schema("app")
+}
+
+/// A program assigned to one member (its own copy of a template; edits make new versions).
+model WorkoutPlan {
+  id               String            @id @default(uuid()) @db.Uuid
+  tenantId         String            @map("tenant_id") @db.Uuid
+  memberId         String            @map("member_id") @db.Uuid
+  templateId       String?           @map("template_id") @db.Uuid
+  trainerUserId    String?           @map("trainer_user_id") @db.Uuid
+  name             String
+  startDate        DateTime          @map("start_date") @db.Date
+  endDate          DateTime?         @map("end_date") @db.Date
+  status           WorkoutPlanStatus @default(ACTIVE)
+  currentVersionId String?           @map("current_version_id") @db.Uuid
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+
+  member   MemberProfile        @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  template WorkoutTemplate?     @relation(fields: [tenantId, templateId], references: [tenantId, id])
+  versions WorkoutPlanVersion[]
+  logs     WorkoutLog[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId, status])
+  @@map("workout_plan")
+  @@schema("app")
+}
+
+/// Immutable: every edit of an assigned plan is a new version (history).
+model WorkoutPlanVersion {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  planId      String   @map("plan_id") @db.Uuid
+  version     Int
+  structure   Json
+  note        String?
+  createdById String?  @map("created_by_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  plan WorkoutPlan  @relation(fields: [tenantId, planId], references: [tenantId, id])
+  logs WorkoutLog[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, planId, version])
+  @@map("workout_plan_version")
+  @@schema("app")
+}
+
+model WorkoutLog {
+  id          String           @id @default(uuid()) @db.Uuid
+  tenantId    String           @map("tenant_id") @db.Uuid
+  memberId    String           @map("member_id") @db.Uuid
+  planId      String?          @map("plan_id") @db.Uuid
+  versionId   String?          @map("version_id") @db.Uuid
+  /// Which planned day: "w1d2" (week 1, day 2); null for a free workout.
+  dayKey      String?          @map("day_key")
+  title       String
+  status      WorkoutLogStatus @default(IN_PROGRESS)
+  /// Local date it counts for (tenant timezone).
+  performedOn DateTime         @map("performed_on") @db.Date
+  startedAt   DateTime         @default(now()) @map("started_at")
+  completedAt DateTime?        @map("completed_at")
+  /// Perceived effort 1–10 (member's own rating).
+  effort      Int?
+  notes       String?
+  createdById String?          @map("created_by_id") @db.Uuid
+  updatedAt   DateTime         @updatedAt @map("updated_at")
+
+  member  MemberProfile       @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  plan    WorkoutPlan?        @relation(fields: [tenantId, planId], references: [tenantId, id])
+  version WorkoutPlanVersion? @relation(fields: [tenantId, versionId], references: [tenantId, id])
+  sets    SetLog[]
+  records PersonalRecord[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId, performedOn])
+  @@map("workout_log")
+  @@schema("app")
+}
+
+model SetLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  logId       String   @map("log_id") @db.Uuid
+  exerciseId  String   @map("exercise_id") @db.Uuid
+  /// The planned item it belongs to (structure item id), if any.
+  planItemId  String?  @map("plan_item_id")
+  setNumber   Int      @map("set_number")
+  reps        Int?
+  /// Kilograms (2 decimals).
+  weightKg    Decimal? @map("weight_kg") @db.Decimal(7, 2)
+  durationSec Int?     @map("duration_sec")
+  distanceM   Int?     @map("distance_m")
+  notes       String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  log      WorkoutLog       @relation(fields: [tenantId, logId], references: [tenantId, id])
+  exercise Exercise         @relation(fields: [tenantId, exerciseId], references: [tenantId, id])
+  records  PersonalRecord[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, logId, exerciseId, setNumber])
+  @@map("set_log")
+  @@schema("app")
+}
+
+/// A best-ever for one exercise and kind; history kept (newest = current), with the set that made it.
+model PersonalRecord {
+  id         String             @id @default(uuid()) @db.Uuid
+  tenantId   String             @map("tenant_id") @db.Uuid
+  memberId   String             @map("member_id") @db.Uuid
+  exerciseId String             @map("exercise_id") @db.Uuid
+  kind       PersonalRecordKind
+  value      Decimal            @db.Decimal(10, 2)
+  previous   Decimal?           @db.Decimal(10, 2)
+  setLogId   String             @map("set_log_id") @db.Uuid
+  logId      String             @map("log_id") @db.Uuid
+  achievedAt DateTime           @map("achieved_at")
+  createdAt  DateTime           @default(now()) @map("created_at")
+
+  member   MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  exercise Exercise      @relation(fields: [tenantId, exerciseId], references: [tenantId, id])
+  setLog   SetLog        @relation(fields: [tenantId, setLogId], references: [tenantId, id])
+  log      WorkoutLog    @relation(fields: [tenantId, logId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId, exerciseId, kind, achievedAt])
+  @@map("personal_record")
+  @@schema("app")
+}
+
+/// Body measurements and fitness tests. metrics follows a fixed schema (packages/core/src/fitness).
+model FitnessAssessment {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @map("tenant_id") @db.Uuid
+  memberId         String   @map("member_id") @db.Uuid
+  assessedOn       DateTime @map("assessed_on") @db.Date
+  metrics          Json
+  notes            String?
+  assessedByUserId String?  @map("assessed_by_user_id") @db.Uuid
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId, assessedOn])
+  @@map("fitness_assessment")
+  @@schema("app")
+}
+
+model MemberGoal {
+  id              String     @id @default(uuid()) @db.Uuid
+  tenantId        String     @map("tenant_id") @db.Uuid
+  memberId        String     @map("member_id") @db.Uuid
+  type            GoalType
+  title           String
+  /// Assessment metric key for WEIGHT/BODY_FAT/MEASUREMENT, exercise id for STRENGTH.
+  metric          String?
+  unit            String?
+  startValue      Decimal?   @map("start_value") @db.Decimal(10, 2)
+  targetValue     Decimal?   @map("target_value") @db.Decimal(10, 2)
+  deadline        DateTime?  @db.Date
+  status          GoalStatus @default(ACTIVE)
+  achievedAt      DateTime?  @map("achieved_at")
+  createdByUserId String?    @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId, status])
+  @@map("member_goal")
+  @@schema("app")
+}
+
+/// A gym's food library: copy of the built-in list (libraryKey) plus its own items. Per 100 g.
+model FoodItem {
+  id           String    @id @default(uuid()) @db.Uuid
+  tenantId     String    @map("tenant_id") @db.Uuid
+  libraryKey   String?   @map("library_key")
+  name         String
+  /// A typical serving, e.g. "1 katori" = 150 g.
+  servingName  String?   @map("serving_name")
+  servingGrams Int?      @map("serving_grams")
+  kcal100      Decimal   @map("kcal_100") @db.Decimal(7, 1)
+  protein100   Decimal   @map("protein_100") @db.Decimal(6, 1)
+  carbs100     Decimal   @map("carbs_100") @db.Decimal(6, 1)
+  fat100       Decimal   @map("fat_100") @db.Decimal(6, 1)
+  /// Where the numbers come from (shown with every estimate).
+  source       String
+  custom       Boolean   @default(false)
+  createdById  String?   @map("created_by_id") @db.Uuid
+  archivedAt   DateTime? @map("archived_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  tenant Tenant         @relation(fields: [tenantId], references: [id])
+  logs   FoodLog[]
+  meals  MealPlanItem[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, libraryKey])
+  @@map("food_item")
+  @@schema("app")
+}
+
+model NutritionPlan {
+  id              String              @id @default(uuid()) @db.Uuid
+  tenantId        String              @map("tenant_id") @db.Uuid
+  memberId        String              @map("member_id") @db.Uuid
+  name            String
+  startDate       DateTime            @map("start_date") @db.Date
+  endDate         DateTime?           @map("end_date") @db.Date
+  status          NutritionPlanStatus @default(ACTIVE)
+  kcalTarget      Int?                @map("kcal_target")
+  proteinTarget   Int?                @map("protein_target")
+  carbsTarget     Int?                @map("carbs_target")
+  fatTarget       Int?                @map("fat_target")
+  waterTargetMl   Int?                @map("water_target_ml")
+  notes           String?
+  createdByUserId String?             @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
+
+  member MemberProfile  @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  meals  MealPlanItem[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId, status])
+  @@map("nutrition_plan")
+  @@schema("app")
+}
+
+model MealPlanItem {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  planId       String   @map("plan_id") @db.Uuid
+  slot         MealSlot
+  time         String?
+  description  String
+  foodItemId   String?  @map("food_item_id") @db.Uuid
+  portionGrams Int?     @map("portion_grams")
+  position     Int      @default(0)
+
+  plan     NutritionPlan @relation(fields: [tenantId, planId], references: [tenantId, id], onDelete: Cascade)
+  foodItem FoodItem?     @relation(fields: [tenantId, foodItemId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@map("meal_plan_item")
+  @@schema("app")
+}
+
+/// What a member ate. Macros are estimates; source and assumptions are stored and shown.
+model FoodLog {
+  id           String        @id @default(uuid()) @db.Uuid
+  tenantId     String        @map("tenant_id") @db.Uuid
+  memberId     String        @map("member_id") @db.Uuid
+  loggedOn     DateTime      @map("logged_on") @db.Date
+  slot         MealSlot
+  foodItemId   String?       @map("food_item_id") @db.Uuid
+  name         String
+  portionGrams Decimal?      @map("portion_grams") @db.Decimal(7, 1)
+  kcal         Decimal       @db.Decimal(7, 1)
+  proteinG     Decimal       @map("protein_g") @db.Decimal(6, 1)
+  carbsG       Decimal       @map("carbs_g") @db.Decimal(6, 1)
+  fatG         Decimal       @map("fat_g") @db.Decimal(6, 1)
+  source       FoodLogSource
+  /// E.g. "IFCT-based library value × 150 g; cooked weight".
+  assumptions  String
+  /// The member changed the estimate by hand.
+  corrected    Boolean       @default(false)
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  member   MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  foodItem FoodItem?     @relation(fields: [tenantId, foodItemId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId, loggedOn])
+  @@map("food_log")
+  @@schema("app")
+}
+
+model WaterLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  memberId  String   @map("member_id") @db.Uuid
+  loggedOn  DateTime @map("logged_on") @db.Date
+  ml        Int
+  createdAt DateTime @default(now()) @map("created_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId, loggedOn])
+  @@map("water_log")
+  @@schema("app")
+}
+
+model TrainerFeedback {
+  id           String         @id @default(uuid()) @db.Uuid
+  tenantId     String         @map("tenant_id") @db.Uuid
+  memberId     String         @map("member_id") @db.Uuid
+  authorUserId String         @map("author_user_id") @db.Uuid
+  target       FeedbackTarget
+  targetId     String?        @map("target_id") @db.Uuid
+  body         String
+  readAt       DateTime?      @map("read_at")
+  createdAt    DateTime       @default(now()) @map("created_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, memberId, createdAt])
+  @@map("trainer_feedback")
+  @@schema("app")
+}
+
+/// Gym news for members (the platform's own Announcement is operator → gyms) (all, one branch, or one plan's members): PWA feed + in-app notification.
+model GymAnnouncement {
+  id          String         @id @default(uuid()) @db.Uuid
+  tenantId    String         @map("tenant_id") @db.Uuid
+  title       String
+  body        String
+  audience    MemberAudience @default(ALL)
+  branchId    String?        @map("branch_id") @db.Uuid
+  planId      String?        @map("plan_id") @db.Uuid
+  publishedAt DateTime       @default(now()) @map("published_at")
+  expiresAt   DateTime?      @map("expires_at")
+  notified    Int            @default(0)
+  createdById String?        @map("created_by_id") @db.Uuid
+  archivedAt  DateTime?      @map("archived_at")
+  createdAt   DateTime       @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, publishedAt])
+  @@map("gym_announcement")
+  @@schema("app")
+}
+
+/// Weekly attendance streak (docs/KPI_DEFINITIONS.md "Streaks"), recomputed from check-ins.
+model StreakState {
+  id            String       @id @default(uuid()) @db.Uuid
+  tenantId      String       @map("tenant_id") @db.Uuid
+  memberId      String       @map("member_id") @db.Uuid
+  currentWeeks  Int          @default(0) @map("current_weeks")
+  longestWeeks  Int          @default(0) @map("longest_weeks")
+  /// Monday of the last week that counted (tenant timezone).
+  lastWeekStart DateTime?    @map("last_week_start") @db.Date
+  status        StreakStatus @default(ACTIVE)
+  computedAt    DateTime     @map("computed_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, memberId])
+  @@map("streak_state")
+  @@schema("app")
+}
+
+model Achievement {
+  id          String          @id @default(uuid()) @db.Uuid
+  tenantId    String          @map("tenant_id") @db.Uuid
+  key         String
+  name        String
+  description String
+  kind        AchievementKind
+  threshold   Int
+  points      Int             @default(0)
+  enabled     Boolean         @default(true)
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  tenant Tenant              @relation(fields: [tenantId], references: [id])
+  earned MemberAchievement[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, key])
+  @@map("achievement")
+  @@schema("app")
+}
+
+model MemberAchievement {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  memberId      String   @map("member_id") @db.Uuid
+  achievementId String   @map("achievement_id") @db.Uuid
+  earnedAt      DateTime @default(now()) @map("earned_at")
+
+  member      MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  achievement Achievement   @relation(fields: [tenantId, achievementId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, memberId, achievementId])
+  @@map("member_achievement")
+  @@schema("app")
+}
+
+/// Attendance- or workout-based challenges only (never body weight).
+model Challenge {
+  id          String          @id @default(uuid()) @db.Uuid
+  tenantId    String          @map("tenant_id") @db.Uuid
+  name        String
+  description String?
+  metric      ChallengeMetric
+  /// Goal to complete it, e.g. 12 visits. Counted at most once per day.
+  target      Int
+  startsOn    DateTime        @map("starts_on") @db.Date
+  endsOn      DateTime        @map("ends_on") @db.Date
+  branchId    String?         @map("branch_id") @db.Uuid
+  leaderboard Boolean         @default(false)
+  points      Int             @default(0)
+  status      ChallengeStatus @default(DRAFT)
+  createdById String?         @map("created_by_id") @db.Uuid
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  tenant       Tenant                 @relation(fields: [tenantId], references: [id])
+  participants ChallengeParticipant[]
+
+  @@unique([tenantId, id])
+  @@map("challenge")
+  @@schema("app")
+}
+
+model ChallengeParticipant {
+  id          String    @id @default(uuid()) @db.Uuid
+  tenantId    String    @map("tenant_id") @db.Uuid
+  challengeId String    @map("challenge_id") @db.Uuid
+  memberId    String    @map("member_id") @db.Uuid
+  /// Shown on the leaderboard instead of the real name (the member's choice).
+  displayName String    @map("display_name")
+  showOnBoard Boolean   @default(true) @map("show_on_board")
+  progress    Int       @default(0)
+  completedAt DateTime? @map("completed_at")
+  joinedAt    DateTime  @default(now()) @map("joined_at")
+  leftAt      DateTime? @map("left_at")
+
+  challenge Challenge     @relation(fields: [tenantId, challengeId], references: [tenantId, id])
+  member    MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, challengeId, memberId])
+  @@map("challenge_participant")
+  @@schema("app")
+}
+
+model RewardRule {
+  id        String        @id @default(uuid()) @db.Uuid
+  tenantId  String        @map("tenant_id") @db.Uuid
+  trigger   RewardTrigger
+  points    Int
+  enabled   Boolean       @default(true)
+  updatedAt DateTime      @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, trigger])
+  @@map("reward_rule")
+  @@schema("app")
+}
+
+/// Points, append-only. sourceKey makes every award happen once ("visit:<id>", "referral:<id>", …).
+model RewardLedger {
+  id           String          @id @default(uuid()) @db.Uuid
+  tenantId     String          @map("tenant_id") @db.Uuid
+  memberId     String          @map("member_id") @db.Uuid
+  kind         RewardEntryKind
+  points       Int
+  reason       String
+  sourceKey    String          @map("source_key")
+  redemptionId String?         @map("redemption_id") @db.Uuid
+  createdById  String?         @map("created_by_id") @db.Uuid
+  createdAt    DateTime        @default(now()) @map("created_at")
+
+  member     MemberProfile     @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  redemption RewardRedemption? @relation(fields: [tenantId, redemptionId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, sourceKey])
+  @@index([tenantId, memberId, createdAt])
+  @@map("reward_ledger")
+  @@schema("app")
+}
+
+/// Things staff hand over for points (a shaker, a free PT session …).
+model RewardPerk {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  name        String
+  description String?
+  pointsCost  Int      @map("points_cost")
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant             @relation(fields: [tenantId], references: [id])
+  redemptions RewardRedemption[]
+
+  @@unique([tenantId, id])
+  @@map("reward_perk")
+  @@schema("app")
+}
+
+model RewardRedemption {
+  id            String           @id @default(uuid()) @db.Uuid
+  tenantId      String           @map("tenant_id") @db.Uuid
+  memberId      String           @map("member_id") @db.Uuid
+  kind          RedemptionKind
+  points        Int
+  perkId        String?          @map("perk_id") @db.Uuid
+  /// CREDIT: the member credit it became (paise).
+  amountMinor   BigInt?          @map("amount_minor")
+  creditEntryId String?          @map("credit_entry_id") @db.Uuid
+  status        RedemptionStatus @default(REQUESTED)
+  note          String?
+  decidedAt     DateTime?        @map("decided_at")
+  decidedById   String?          @map("decided_by_id") @db.Uuid
+  createdAt     DateTime         @default(now()) @map("created_at")
+
+  member  MemberProfile  @relation(fields: [tenantId, memberId], references: [tenantId, id])
+  perk    RewardPerk?    @relation(fields: [tenantId, perkId], references: [tenantId, id])
+  entries RewardLedger[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, status, createdAt])
+  @@map("reward_redemption")
+  @@schema("app")
+}
+
+/// One shareable code per member (no personal data in it).
+model ReferralCode {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  memberId  String   @map("member_id") @db.Uuid
+  code      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  member MemberProfile @relation(fields: [tenantId, memberId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, memberId])
+  @@unique([tenantId, code])
+  @@map("referral_code")
+  @@schema("app")
+}
+
+model Referral {
+  id               String         @id @default(uuid()) @db.Uuid
+  tenantId         String         @map("tenant_id") @db.Uuid
+  referrerMemberId String         @map("referrer_member_id") @db.Uuid
+  leadId           String?        @map("lead_id") @db.Uuid
+  referredMemberId String?        @map("referred_member_id") @db.Uuid
+  membershipId     String?        @map("membership_id") @db.Uuid
+  status           ReferralStatus @default(PENDING)
+  joinedAt         DateTime?      @map("joined_at")
+  rewardedAt       DateTime?      @map("rewarded_at")
+  rewardPoints     Int?           @map("reward_points")
+  note             String?
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  referrer MemberProfile  @relation("ReferralReferrer", fields: [tenantId, referrerMemberId], references: [tenantId, id])
+  referred MemberProfile? @relation("ReferralReferred", fields: [tenantId, referredMemberId], references: [tenantId, id])
+  lead     Lead?          @relation(fields: [tenantId, leadId], references: [tenantId, id])
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, leadId])
+  @@index([tenantId, referrerMemberId])
+  @@map("referral")
+  @@schema("app")
+}
+
+// ===================================================================================
+// M8: intelligence — KPI rollups (derived data), the platform AI provider, Copilot request log.
+// ===================================================================================
+
+/// Derived data: one row per branch per tenant-local day, written by the nightly `metrics.rollup`
+/// job and by `pnpm metrics:rebuild`. Never the source of truth: every value can be recomputed from
+/// the live tables, except the active/paused snapshots for days before the first nightly run, which
+/// are reconstructed from membership dates (`reconstructed` = true).
+model MetricDaily {
+  tenantId      String   @map("tenant_id") @db.Uuid
+  branchId      String   @map("branch_id") @db.Uuid
+  day           DateTime @db.Date
+  activeMembers Int      @default(0) @map("active_members")
+  pausedMembers Int      @default(0) @map("paused_members")
+  newMembers    Int      @default(0) @map("new_members")
+  checkIns      Int      @default(0) @map("check_ins")
+  uniqueVisits  Int      @default(0) @map("unique_visits")
+  invoicedMinor BigInt   @default(0) @map("invoiced_minor")
+  paymentsMinor BigInt   @default(0) @map("payments_minor")
+  refundsMinor  BigInt   @default(0) @map("refunds_minor")
+  reconstructed Boolean  @default(false)
+  computedAt    DateTime @map("computed_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  branch Branch @relation(fields: [tenantId, branchId], references: [tenantId, id])
+
+  @@id([tenantId, branchId, day])
+  @@index([tenantId, day])
+  @@map("metric_daily")
+  @@schema("app")
+}
+
+/// The platform's OpenAI-compatible AI provider (one row, id "default"). Switch provider or model
+/// here without code changes. The API key is sealed with the platform SecretBox and never sent to
+/// a browser; gyms' runtime role can read only the columns needed to make a request.
+model AiProvider {
+  id                  String    @id @default("default")
+  label               String
+  baseUrl             String    @map("base_url")
+  model               String
+  apiKeySealed        String?   @map("api_key_sealed")
+  /// Last 4 characters, for the admin screen.
+  apiKeyHint          String?   @map("api_key_hint")
+  timeoutMs           Int       @default(30000) @map("timeout_ms")
+  maxTokens           Int       @default(800) @map("max_tokens")
+  enabled             Boolean   @default(false)
+  /// Detected by "Test connection": null = not tested. False = Copilot uses the fallback summary.
+  supportsTools       Boolean?  @map("supports_tools")
+  lastTestedAt        DateTime? @map("last_tested_at")
+  lastTestOk          Boolean?  @map("last_test_ok")
+  lastTestMessage     String?   @map("last_test_message")
+  /// Copilot request logs (no question or answer text) are deleted after this many days.
+  logRetentionDays    Int       @default(90) @map("log_retention_days")
+  /// Per gym: at most this many questions a minute (and 10× per day).
+  tenantRatePerMinute Int       @default(6) @map("tenant_rate_per_minute")
+  updatedById         String?   @map("updated_by_id") @db.Uuid
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  @@map("ai_provider")
+  @@schema("platform")
+}
+
+enum AiRequestOutcome {
+  ANSWERED
+  /// The provider can't call tools (or failed); the answer is the server-built summary.
+  FALLBACK
+  /// The answer had numbers not found in tool results; shown with a warning.
+  FLAGGED
+  ERROR
+
+  @@schema("app")
+}
+
+/// One Copilot question: which tools ran, how long, token counts. Never the question, the answer
+/// or tool results (they can hold member data). Deleted after the provider's log retention.
+model AiRequestLog {
+  id                String           @id @default(uuid()) @db.Uuid
+  tenantId          String           @map("tenant_id") @db.Uuid
+  userId            String           @map("user_id") @db.Uuid
+  outcome           AiRequestOutcome
+  /// TOOLS | FALLBACK | FAKE
+  mode              String
+  model             String?
+  /// [{ name, ms, ok }]
+  toolCalls         Json             @default("[]") @map("tool_calls")
+  promptTokens      Int              @default(0) @map("prompt_tokens")
+  completionTokens  Int              @default(0) @map("completion_tokens")
+  latencyMs         Int              @default(0) @map("latency_ms")
+  ungroundedNumbers Int              @default(0) @map("ungrounded_numbers")
+  createdAt         DateTime         @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, id])
+  @@index([tenantId, createdAt])
+  @@map("ai_request_log")
+  @@schema("app")
+}

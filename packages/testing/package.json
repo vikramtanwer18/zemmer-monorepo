@@ -1,0 +1,30 @@
+{
+  "name": "@gym/testing",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./e2e": "./src/e2e.ts",
+    "./containers": "./src/containers.ts"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0"
+  },
+  "dependencies": {
+    "@testcontainers/postgresql": "12.2.1",
+    "@testcontainers/redis": "12.2.1",
+    "ioredis": "5.11.1",
+    "pg": "^8.23.1",
+    "testcontainers": "12.2.1"
+  },
+  "devDependencies": {
+    "@gym/eslint-config": "workspace:*",
+    "@gym/typescript-config": "workspace:*",
+    "@types/node": "26.4.1",
+    "@types/pg": "^8.23.1",
+    "eslint": "10.9.1",
+    "typescript": "7.0.2"
+  }
+}

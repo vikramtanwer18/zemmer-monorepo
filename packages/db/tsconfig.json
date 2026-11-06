@@ -1,0 +1,14 @@
+{
+  "extends": "@gym/typescript-config/base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": [
+    "src",
+    "test",
+    "generated",
+    "prisma.config.ts",
+    "vitest.int.config.ts"
+  ]
+}

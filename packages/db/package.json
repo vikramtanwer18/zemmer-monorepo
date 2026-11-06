@@ -1,0 +1,37 @@
+{
+  "name": "@gym/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "tsx src/seed.ts",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "test:int": "vitest run --config vitest.int.config.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@gym/eslint-config": "workspace:*",
+    "@gym/testing": "workspace:*",
+    "@gym/typescript-config": "workspace:*",
+    "@types/node": "26.4.1",
+    "@types/pg": "^8.23.1",
+    "dotenv": "^18.0.9",
+    "eslint": "10.9.1",
+    "prisma": "7.10.1",
+    "tsx": "^4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

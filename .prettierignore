@@ -1,0 +1,21 @@
+pnpm-lock.yaml
+generated
+.next
+dist
+.turbo
+coverage
+test-results
+playwright-report
+blob-report
+
+# Reference documents and tool-managed files: keep as written.
+gym-saas-claude-code-kit
+Gym SaaS — Developer Setup Guide (Turborepo).md
+docs/DECISIONS.md
+docs/MASTER_SPEC.md
+docs/KPI_DEFINITIONS.md
+docs/milestones
+CLAUDE.md
+AGENTS.md
+**/AGENTS.md
+docs/PERMISSIONS.md

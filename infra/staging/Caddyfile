@@ -1,0 +1,18 @@
+# APP_HOST / ADMIN_HOST come from .env.staging (e.g. app.staging.example.in, admin.staging.example.in).
+# Caddy gets and renews the certificates; DNS for both names must point at this host first.
+{
+	email {$ACME_EMAIL}
+}
+
+{$APP_HOST} {
+	encode zstd gzip
+	reverse_proxy web:3000
+}
+
+{$ADMIN_HOST} {
+	encode zstd gzip
+	# Optional extra wall for the operator console: allow only office/VPN addresses.
+	# @blocked not remote_ip {$ADMIN_ALLOWED_IPS}
+	# respond @blocked 403
+	reverse_proxy admin:3001
+}

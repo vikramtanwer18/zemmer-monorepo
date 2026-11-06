@@ -1,0 +1,51 @@
+# Staging on one EC2 host (see infra/staging/README.md). Postgres = RDS, Redis = ElastiCache,
+# files = S3, email = SES: none of them run here. Secrets come from .env.staging, rendered from
+# Secrets Manager by render-env.sh (never committed).
+#
+#   docker compose -f infra/staging/compose.yml --env-file infra/staging/.env.staging up -d --build
+
+x-app: &app
+  restart: unless-stopped
+  env_file: .env.staging
+  logging:
+    driver: awslogs
+    options:
+      awslogs-region: ap-south-1
+      awslogs-group: /gym-saas/staging
+      awslogs-create-group: "true"
+      tag: "{{.Name}}"
+
+services:
+  web:
+    <<: *app
+    build: { context: ../.., dockerfile: apps/web/Dockerfile }
+    image: gym-web:staging
+    expose: ["3000"]
+
+  admin:
+    <<: *app
+    build: { context: ../.., dockerfile: apps/admin/Dockerfile }
+    image: gym-admin:staging
+    expose: ["3001"]
+    environment:
+      PORT: "3001"
+
+  worker:
+    <<: *app
+    build: { context: ../.., dockerfile: apps/worker/Dockerfile }
+    image: gym-worker:staging
+    expose: ["4100"]
+
+  # TLS (Let's Encrypt) and routing for both hostnames.
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    env_file: .env.staging
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on: [web, admin]
+
+volumes:
+  caddy-data:

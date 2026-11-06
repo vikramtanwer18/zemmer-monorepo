@@ -1,0 +1,9 @@
+{
+  "extends": "@gym/typescript-config/react-library.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["src", "vitest.config.ts", "vitest.setup.ts"],
+  "exclude": ["node_modules", "dist"]
+}

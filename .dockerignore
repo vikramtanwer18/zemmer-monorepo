@@ -1,0 +1,15 @@
+**/node_modules
+**/.next
+**/dist
+**/.turbo
+**/generated
+**/test-results
+**/playwright-report
+.git
+.github
+gym-saas-claude-code-kit
+
+# Secrets never go into images; variables arrive at runtime.
+.env
+.env.*
+!.env.example

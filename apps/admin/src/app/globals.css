@@ -1,0 +1,10 @@
+@import "tailwindcss";
+@import "@gym/ui/theme.css";
+
+/* Tailwind only generates classes it finds; the UI package lives outside this app. */
+@source "../../../../packages/ui/src";
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
